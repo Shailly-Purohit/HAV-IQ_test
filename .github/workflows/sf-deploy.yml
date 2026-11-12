@@ -1,0 +1,2177 @@
+name: SF Deploy
+
+on:
+  push:
+    branches:
+      - "promote/**"
+      - "rollback/**"
+      - "feature/*-to-*-resolve-*"
+      - "production"
+      - "qa"
+      - "dev"
+      - "dev1"
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+
+  # ── dev → qa
+  validate_dev_to_qa:
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref_name, 'promote/dev-to-qa-')
+      || startsWith(github.ref_name, 'feature/dev-to-qa-resolve-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-472: "Validate" must validate, not deploy.
+          git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level NoTestRun
+      - name: Notify HAV-IQ
+        if: failure()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+  deploy_dev_to_qa:
+    needs: validate_dev_to_qa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+          if git log -1 --pretty=%B | grep -q "\[run-tests\]"; then
+            for i in 1 2 3; do sf apex run test --target-org target --test-level RunLocalTests --wait 10 && break; [ $i -lt 3 ] && echo "Test run busy, retrying in 60s..." && sleep 60 || exit 1; done
+          fi
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-472: "Validate" must validate, not deploy.
+          git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          sf project deploy $DCMD --manifest manifest/package.xml --target-org target
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── qa → dev (back-promote)
+  back_promote_qa_to_dev:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'promote/qa-to-dev-')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Authenticate to the back-promote target org
+        run: |
+          echo "${{ secrets.SF_JWT_KEY_DEV }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV }} --instance-url ${{ vars.SF_ORG_URL_DEV }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - name: Back-promote to dev
+        run: |
+          sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
+      - name: Apply destructive changes
+        run: |
+          if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --post-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          else
+            echo "No destructive changes."
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+  deploy_destructive_dev_to_qa:
+    needs: deploy_dev_to_qa
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref_name, 'promote/dev-to-qa-')
+      || startsWith(github.ref_name, 'feature/dev-to-qa-resolve-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+          if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
+            echo "No destructive changes for this deploy — nothing to do."; exit 0
+          fi
+          if git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]"; then
+            echo "Validate-only run — skipping destructive changes."; exit 0
+          fi
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
+            echo "No destructive changes for this deploy — nothing to do."; exit 0
+          fi
+          if git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]"; then
+            echo "Validate-only run — skipping destructive changes."; exit 0
+          fi
+          set +e
+          DOUT=$(sf project deploy start --manifest manifest/package.xml --pre-destructive-changes manifest/destructiveChanges.xml --target-org target --wait 30 2>&1)
+          DRC=$?
+          set -e
+          echo "$DOUT"
+          if [ $DRC -ne 0 ]; then
+            ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+            OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+            if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+              echo "[OI-317] Deletions skipped - already absent from the target org:"
+              echo "$ABSENT"
+              echo "[OI-317] The intended end state is already true. Continuing."
+              echo "$ABSENT" > /tmp/haviq-already-absent.txt
+            else
+              echo "[OI-317] Destructive deploy failed beyond already-absent components."
+              exit $DRC
+            fi
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── dev1 → qa
+  validate_dev1_to_qa:
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref_name, 'promote/dev1-to-qa-')
+      || startsWith(github.ref_name, 'feature/dev1-to-qa-resolve-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-472: "Validate" must validate, not deploy.
+          git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level NoTestRun
+      - name: Notify HAV-IQ
+        if: failure()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+  deploy_dev1_to_qa:
+    needs: validate_dev1_to_qa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+          if git log -1 --pretty=%B | grep -q "\[run-tests\]"; then
+            for i in 1 2 3; do sf apex run test --target-org target --test-level RunLocalTests --wait 10 && break; [ $i -lt 3 ] && echo "Test run busy, retrying in 60s..." && sleep 60 || exit 1; done
+          fi
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-472: "Validate" must validate, not deploy.
+          git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          sf project deploy $DCMD --manifest manifest/package.xml --target-org target
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── qa → dev1 (back-promote)
+  back_promote_qa_to_dev1:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'promote/qa-to-dev1-')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Authenticate to the back-promote target org
+        run: |
+          echo "${{ secrets.SF_JWT_KEY_DEV1 }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV1 }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV1 }} --instance-url ${{ vars.SF_ORG_URL_DEV1 }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - name: Back-promote to dev1
+        run: |
+          sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
+      - name: Apply destructive changes
+        run: |
+          if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --post-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          else
+            echo "No destructive changes."
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+  deploy_destructive_dev1_to_qa:
+    needs: deploy_dev1_to_qa
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref_name, 'promote/dev1-to-qa-')
+      || startsWith(github.ref_name, 'feature/dev1-to-qa-resolve-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+          if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
+            echo "No destructive changes for this deploy — nothing to do."; exit 0
+          fi
+          if git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]"; then
+            echo "Validate-only run — skipping destructive changes."; exit 0
+          fi
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
+            echo "No destructive changes for this deploy — nothing to do."; exit 0
+          fi
+          if git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]"; then
+            echo "Validate-only run — skipping destructive changes."; exit 0
+          fi
+          set +e
+          DOUT=$(sf project deploy start --manifest manifest/package.xml --pre-destructive-changes manifest/destructiveChanges.xml --target-org target --wait 30 2>&1)
+          DRC=$?
+          set -e
+          echo "$DOUT"
+          if [ $DRC -ne 0 ]; then
+            ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+            OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+            if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+              echo "[OI-317] Deletions skipped - already absent from the target org:"
+              echo "$ABSENT"
+              echo "[OI-317] The intended end state is already true. Continuing."
+              echo "$ABSENT" > /tmp/haviq-already-absent.txt
+            else
+              echo "[OI-317] Destructive deploy failed beyond already-absent components."
+              exit $DRC
+            fi
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── qa → production
+  validate_qa_to_production:
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref_name, 'promote/qa-to-production-')
+      || startsWith(github.ref_name, 'feature/qa-to-production-resolve-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-472: "Validate" must validate, not deploy.
+          git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level NoTestRun
+      - name: Notify HAV-IQ
+        if: failure()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+  deploy_qa_to_production:
+    needs: validate_qa_to_production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
+          if git log -1 --pretty=%B | grep -q "\[run-tests\]"; then
+            for i in 1 2 3; do sf apex run test --target-org target --test-level RunLocalTests --wait 10 && break; [ $i -lt 3 ] && echo "Test run busy, retrying in 60s..." && sleep 60 || exit 1; done
+          fi
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-472: "Validate" must validate, not deploy.
+          git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          sf project deploy $DCMD --manifest manifest/package.xml --target-org target
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── production → qa (back-promote)
+  back_promote_production_to_qa:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'promote/production-to-qa-')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Authenticate to the back-promote target org
+        run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - name: Back-promote to qa
+        run: |
+          sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
+      - name: Apply destructive changes
+        run: |
+          if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --post-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          else
+            echo "No destructive changes."
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+  deploy_destructive_qa_to_production:
+    needs: deploy_qa_to_production
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref_name, 'promote/qa-to-production-')
+      || startsWith(github.ref_name, 'feature/qa-to-production-resolve-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
+          if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
+            echo "No destructive changes for this deploy — nothing to do."; exit 0
+          fi
+          if git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]"; then
+            echo "Validate-only run — skipping destructive changes."; exit 0
+          fi
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
+            echo "No destructive changes for this deploy — nothing to do."; exit 0
+          fi
+          if git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]"; then
+            echo "Validate-only run — skipping destructive changes."; exit 0
+          fi
+          set +e
+          DOUT=$(sf project deploy start --manifest manifest/package.xml --pre-destructive-changes manifest/destructiveChanges.xml --target-org target --wait 30 2>&1)
+          DRC=$?
+          set -e
+          echo "$DOUT"
+          if [ $DRC -ne 0 ]; then
+            ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+            OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+            if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+              echo "[OI-317] Deletions skipped - already absent from the target org:"
+              echo "$ABSENT"
+              echo "[OI-317] The intended end state is already true. Continuing."
+              echo "$ABSENT" > /tmp/haviq-already-absent.txt
+            else
+              echo "[OI-317] Destructive deploy failed beyond already-absent components."
+              exit $DRC
+            fi
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── Rollback: production
+  rollback_production:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'rollback/production-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-278 (v1.50): single sf project deploy start per rollback job
+          HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
+          HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
+          if [ "$HAS_DEL" = "1" ]; then
+            echo "Rollback: reverting (destructive + restore in one operation)..."
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --pre-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          elif [ "$HAS_PKG" = "1" ]; then
+            echo "Rollback: restoring components..."
+            sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
+          else
+            echo "Rollback: nothing to deploy (empty manifests)."
+            exit 1
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── Retrieve from production (RM-CI-RETRIEVE)
+  haviq_retrieve_production:
+    name: haviq:retrieve-production
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push'
+      && github.ref_name == 'production'
+      && contains(github.event.head_commit.message, '[haviq-retrieve]')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Retrieve and commit
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_PRODUCTION }}
+        run: |
+          set -e
+          git log -1 --pretty=%B > /tmp/haviq_msg.txt
+          echo "$SF_JWT_KEY" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias haviq-source
+          if [ -f .forceignore ]; then
+            for T in $(grep -oE "<name>[A-Za-z]+</name>" manifest/haviq-retrieve.xml 2>/dev/null | sed "s/<[^>]*>//g" | sort -u); do
+              LT=$(echo "$T" | tr "[:upper:]" "[:lower:]")
+              if grep -qi "/${LT}s\?/" .forceignore; then
+                echo "[haviq] WARNING: .forceignore appears to exclude $T."
+                echo "[haviq] The CLI will write nothing for it and still exit 0."
+                echo "[haviq] Remove the matching line from .forceignore:"
+                grep -n -i "/${LT}s\?/" .forceignore | sed "s/^/[haviq]   /"
+              fi
+            done
+          fi
+          sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
+            echo "[haviq] None of the requested types exist in this org. Nothing to"
+            echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
+            exit 1
+          fi
+          sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
+          MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+          echo "[haviq] retrieved: $MEMBERS"
+          if [ -s /tmp/haviq_drop.txt ]; then
+            while IFS= read -r P; do
+              [ -z "$P" ] && continue
+              if [ -e "$P" ]; then rm -f "$P";
+              else find force-app -type f -name "${P}.*" -delete 2>/dev/null || true; fi
+            done < /tmp/haviq_drop.txt
+          fi
+          printf "%s" "$MEMBERS" > /tmp/haviq_members.txt
+          if [ -z "$MEMBERS" ]; then
+            echo "[haviq] The retrieve returned no components. Nothing will be"
+            echo "[haviq] committed — a commit here would delete the request file"
+            echo "[haviq] and report success having retrieved nothing."
+            exit 1
+          fi
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));ms=(d.get('result') or {}).get('messages') or [];ms=[ms] if isinstance(ms,dict) else ms;[print('[haviq] WARNING from retrieve: '+str(m.get('problem'))) for m in ms]" 2>/dev/null || true
+          git config user.email "ci@haviq.local"
+          git config user.name "HAV-IQ CI"
+          cp -f manifest/haviq-retrieve-keep.txt /tmp/haviq_keep.txt 2>/dev/null || true
+          rm -f manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt
+          git rm -q --cached --ignore-unmatch manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt >/dev/null 2>&1 || true
+          if [ -s /tmp/haviq_keep.txt ]; then
+            while IFS= read -r KD; do
+              [ -n "$KD" ] && git add -- "$KD" 2>/dev/null || true
+            done < /tmp/haviq_keep.txt
+          else
+            echo "[haviq] no keep-list in the request — refusing to guess"
+            echo "[haviq] which retrieved files are safe to commit."
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "[haviq] nothing to commit — the retrieve produced no files."
+          else
+            git commit -m "chore: HAV-IQ CI retrieve [skip ci]"
+            n=0
+            until git push origin HEAD:production 2>/tmp/haviq_push.err; do
+              n=$((n+1))
+              sed "s/^/[haviq]   /" /tmp/haviq_push.err || true
+              if grep -qiE "restrict|protected|permission|denied|403" /tmp/haviq_push.err; then
+                echo "[haviq] GitHub refused the push to production. Branch protection on it"
+                echo "[haviq] blocks the workflow's GITHUB_TOKEN. Allow GitHub Actions to push to"
+                echo "[haviq] production (or exempt it from the rule), then retry the deployment."
+                exit 1
+              fi
+              [ $n -ge 3 ] && echo "[haviq] push failed after $n attempts" && exit 1
+              echo "[haviq] push rejected — the branch moved. Rebasing (attempt $n)."
+              git pull --rebase origin production || { \
+                echo "[haviq] REBASE CONFLICT. Someone edited the same component"; \
+                echo "[haviq] while this retrieve was running. Resolve it in HAV-IQ"; \
+                echo "[haviq] and retry — this job will not resolve it for you."; \
+                exit 1; }
+            done
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
+          HQ_BRANCH: ${{ github.ref_name }}
+          HQ_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HAVIQ_PRIVATE_KEY: ${{ secrets.HAVIQ_PRIVATE_KEY }}
+          HAVIQ_CLIENT_ID: ${{ vars.HAVIQ_CLIENT_ID }}
+          HAVIQ_USERNAME: ${{ vars.HAVIQ_USERNAME }}
+          HAVIQ_URL: ${{ vars.HAVIQ_URL }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+        run: |
+          grep -q "\[haviq-retrieve\]" /tmp/haviq_msg.txt 2>/dev/null || exit 0
+          echo "$HAVIQ_PRIVATE_KEY" > /tmp/haviq.key
+          HAVIQ_LOGIN_OUT=$(sf org login jwt --client-id "$HAVIQ_CLIENT_ID" --jwt-key-file /tmp/haviq.key --username "$HAVIQ_USERNAME" --instance-url "$HAVIQ_URL" --alias haviq-hub 2>&1) || true
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          case "$SF_TOKEN" in *[[:space:]]*) SF_TOKEN="" ;; esac
+          if [ -z "$SF_TOKEN" ]; then
+            echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
+            echo "[haviq] run's result itself within a few minutes. The JWT login said:"
+            echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
+          else
+            DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
+            MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+            BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "$HAVIQ_URL/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "[haviq] retrieve callback HTTP $HAVIQ_HTTP"
+            [ "$HAVIQ_HTTP" = "200" ] || head -c 500 /tmp/haviq_cb.out 2>/dev/null | sed "s/^/[haviq]   /" || true
+            rm -f /tmp/haviq_cb.out
+          fi
+          rm -f /tmp/haviq.key server.key /tmp/haviq_members.txt
+
+  # ── Rollback: qa
+  rollback_qa:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'rollback/qa-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-278 (v1.50): single sf project deploy start per rollback job
+          HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
+          HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
+          if [ "$HAS_DEL" = "1" ]; then
+            echo "Rollback: reverting (destructive + restore in one operation)..."
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --pre-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          elif [ "$HAS_PKG" = "1" ]; then
+            echo "Rollback: restoring components..."
+            sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
+          else
+            echo "Rollback: nothing to deploy (empty manifests)."
+            exit 1
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── Retrieve from qa (RM-CI-RETRIEVE)
+  haviq_retrieve_qa:
+    name: haviq:retrieve-qa
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push'
+      && github.ref_name == 'qa'
+      && contains(github.event.head_commit.message, '[haviq-retrieve]')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Retrieve and commit
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_QA }}
+        run: |
+          set -e
+          git log -1 --pretty=%B > /tmp/haviq_msg.txt
+          echo "$SF_JWT_KEY" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias haviq-source
+          if [ -f .forceignore ]; then
+            for T in $(grep -oE "<name>[A-Za-z]+</name>" manifest/haviq-retrieve.xml 2>/dev/null | sed "s/<[^>]*>//g" | sort -u); do
+              LT=$(echo "$T" | tr "[:upper:]" "[:lower:]")
+              if grep -qi "/${LT}s\?/" .forceignore; then
+                echo "[haviq] WARNING: .forceignore appears to exclude $T."
+                echo "[haviq] The CLI will write nothing for it and still exit 0."
+                echo "[haviq] Remove the matching line from .forceignore:"
+                grep -n -i "/${LT}s\?/" .forceignore | sed "s/^/[haviq]   /"
+              fi
+            done
+          fi
+          sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
+            echo "[haviq] None of the requested types exist in this org. Nothing to"
+            echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
+            exit 1
+          fi
+          sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
+          MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+          echo "[haviq] retrieved: $MEMBERS"
+          if [ -s /tmp/haviq_drop.txt ]; then
+            while IFS= read -r P; do
+              [ -z "$P" ] && continue
+              if [ -e "$P" ]; then rm -f "$P";
+              else find force-app -type f -name "${P}.*" -delete 2>/dev/null || true; fi
+            done < /tmp/haviq_drop.txt
+          fi
+          printf "%s" "$MEMBERS" > /tmp/haviq_members.txt
+          if [ -z "$MEMBERS" ]; then
+            echo "[haviq] The retrieve returned no components. Nothing will be"
+            echo "[haviq] committed — a commit here would delete the request file"
+            echo "[haviq] and report success having retrieved nothing."
+            exit 1
+          fi
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));ms=(d.get('result') or {}).get('messages') or [];ms=[ms] if isinstance(ms,dict) else ms;[print('[haviq] WARNING from retrieve: '+str(m.get('problem'))) for m in ms]" 2>/dev/null || true
+          git config user.email "ci@haviq.local"
+          git config user.name "HAV-IQ CI"
+          cp -f manifest/haviq-retrieve-keep.txt /tmp/haviq_keep.txt 2>/dev/null || true
+          rm -f manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt
+          git rm -q --cached --ignore-unmatch manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt >/dev/null 2>&1 || true
+          if [ -s /tmp/haviq_keep.txt ]; then
+            while IFS= read -r KD; do
+              [ -n "$KD" ] && git add -- "$KD" 2>/dev/null || true
+            done < /tmp/haviq_keep.txt
+          else
+            echo "[haviq] no keep-list in the request — refusing to guess"
+            echo "[haviq] which retrieved files are safe to commit."
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "[haviq] nothing to commit — the retrieve produced no files."
+          else
+            git commit -m "chore: HAV-IQ CI retrieve [skip ci]"
+            n=0
+            until git push origin HEAD:qa 2>/tmp/haviq_push.err; do
+              n=$((n+1))
+              sed "s/^/[haviq]   /" /tmp/haviq_push.err || true
+              if grep -qiE "restrict|protected|permission|denied|403" /tmp/haviq_push.err; then
+                echo "[haviq] GitHub refused the push to qa. Branch protection on it"
+                echo "[haviq] blocks the workflow's GITHUB_TOKEN. Allow GitHub Actions to push to"
+                echo "[haviq] qa (or exempt it from the rule), then retry the deployment."
+                exit 1
+              fi
+              [ $n -ge 3 ] && echo "[haviq] push failed after $n attempts" && exit 1
+              echo "[haviq] push rejected — the branch moved. Rebasing (attempt $n)."
+              git pull --rebase origin qa || { \
+                echo "[haviq] REBASE CONFLICT. Someone edited the same component"; \
+                echo "[haviq] while this retrieve was running. Resolve it in HAV-IQ"; \
+                echo "[haviq] and retry — this job will not resolve it for you."; \
+                exit 1; }
+            done
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
+          HQ_BRANCH: ${{ github.ref_name }}
+          HQ_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HAVIQ_PRIVATE_KEY: ${{ secrets.HAVIQ_PRIVATE_KEY }}
+          HAVIQ_CLIENT_ID: ${{ vars.HAVIQ_CLIENT_ID }}
+          HAVIQ_USERNAME: ${{ vars.HAVIQ_USERNAME }}
+          HAVIQ_URL: ${{ vars.HAVIQ_URL }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+        run: |
+          grep -q "\[haviq-retrieve\]" /tmp/haviq_msg.txt 2>/dev/null || exit 0
+          echo "$HAVIQ_PRIVATE_KEY" > /tmp/haviq.key
+          HAVIQ_LOGIN_OUT=$(sf org login jwt --client-id "$HAVIQ_CLIENT_ID" --jwt-key-file /tmp/haviq.key --username "$HAVIQ_USERNAME" --instance-url "$HAVIQ_URL" --alias haviq-hub 2>&1) || true
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          case "$SF_TOKEN" in *[[:space:]]*) SF_TOKEN="" ;; esac
+          if [ -z "$SF_TOKEN" ]; then
+            echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
+            echo "[haviq] run's result itself within a few minutes. The JWT login said:"
+            echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
+          else
+            DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
+            MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+            BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "$HAVIQ_URL/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "[haviq] retrieve callback HTTP $HAVIQ_HTTP"
+            [ "$HAVIQ_HTTP" = "200" ] || head -c 500 /tmp/haviq_cb.out 2>/dev/null | sed "s/^/[haviq]   /" || true
+            rm -f /tmp/haviq_cb.out
+          fi
+          rm -f /tmp/haviq.key server.key /tmp/haviq_members.txt
+
+  # ── Rollback: dev
+  rollback_dev:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'rollback/dev-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_DEV }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV }} --instance-url ${{ vars.SF_ORG_URL_DEV }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-278 (v1.50): single sf project deploy start per rollback job
+          HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
+          HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
+          if [ "$HAS_DEL" = "1" ]; then
+            echo "Rollback: reverting (destructive + restore in one operation)..."
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --pre-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          elif [ "$HAS_PKG" = "1" ]; then
+            echo "Rollback: restoring components..."
+            sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
+          else
+            echo "Rollback: nothing to deploy (empty manifests)."
+            exit 1
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── Retrieve from dev (RM-CI-RETRIEVE)
+  haviq_retrieve_dev:
+    name: haviq:retrieve-dev
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push'
+      && github.ref_name == 'dev'
+      && contains(github.event.head_commit.message, '[haviq-retrieve]')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Retrieve and commit
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_DEV }}
+        run: |
+          set -e
+          git log -1 --pretty=%B > /tmp/haviq_msg.txt
+          echo "$SF_JWT_KEY" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV }} --instance-url ${{ vars.SF_ORG_URL_DEV }} --alias haviq-source
+          if [ -f .forceignore ]; then
+            for T in $(grep -oE "<name>[A-Za-z]+</name>" manifest/haviq-retrieve.xml 2>/dev/null | sed "s/<[^>]*>//g" | sort -u); do
+              LT=$(echo "$T" | tr "[:upper:]" "[:lower:]")
+              if grep -qi "/${LT}s\?/" .forceignore; then
+                echo "[haviq] WARNING: .forceignore appears to exclude $T."
+                echo "[haviq] The CLI will write nothing for it and still exit 0."
+                echo "[haviq] Remove the matching line from .forceignore:"
+                grep -n -i "/${LT}s\?/" .forceignore | sed "s/^/[haviq]   /"
+              fi
+            done
+          fi
+          sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
+            echo "[haviq] None of the requested types exist in this org. Nothing to"
+            echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
+            exit 1
+          fi
+          sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
+          MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+          echo "[haviq] retrieved: $MEMBERS"
+          if [ -s /tmp/haviq_drop.txt ]; then
+            while IFS= read -r P; do
+              [ -z "$P" ] && continue
+              if [ -e "$P" ]; then rm -f "$P";
+              else find force-app -type f -name "${P}.*" -delete 2>/dev/null || true; fi
+            done < /tmp/haviq_drop.txt
+          fi
+          printf "%s" "$MEMBERS" > /tmp/haviq_members.txt
+          if [ -z "$MEMBERS" ]; then
+            echo "[haviq] The retrieve returned no components. Nothing will be"
+            echo "[haviq] committed — a commit here would delete the request file"
+            echo "[haviq] and report success having retrieved nothing."
+            exit 1
+          fi
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));ms=(d.get('result') or {}).get('messages') or [];ms=[ms] if isinstance(ms,dict) else ms;[print('[haviq] WARNING from retrieve: '+str(m.get('problem'))) for m in ms]" 2>/dev/null || true
+          git config user.email "ci@haviq.local"
+          git config user.name "HAV-IQ CI"
+          cp -f manifest/haviq-retrieve-keep.txt /tmp/haviq_keep.txt 2>/dev/null || true
+          rm -f manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt
+          git rm -q --cached --ignore-unmatch manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt >/dev/null 2>&1 || true
+          if [ -s /tmp/haviq_keep.txt ]; then
+            while IFS= read -r KD; do
+              [ -n "$KD" ] && git add -- "$KD" 2>/dev/null || true
+            done < /tmp/haviq_keep.txt
+          else
+            echo "[haviq] no keep-list in the request — refusing to guess"
+            echo "[haviq] which retrieved files are safe to commit."
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "[haviq] nothing to commit — the retrieve produced no files."
+          else
+            git commit -m "chore: HAV-IQ CI retrieve [skip ci]"
+            n=0
+            until git push origin HEAD:dev 2>/tmp/haviq_push.err; do
+              n=$((n+1))
+              sed "s/^/[haviq]   /" /tmp/haviq_push.err || true
+              if grep -qiE "restrict|protected|permission|denied|403" /tmp/haviq_push.err; then
+                echo "[haviq] GitHub refused the push to dev. Branch protection on it"
+                echo "[haviq] blocks the workflow's GITHUB_TOKEN. Allow GitHub Actions to push to"
+                echo "[haviq] dev (or exempt it from the rule), then retry the deployment."
+                exit 1
+              fi
+              [ $n -ge 3 ] && echo "[haviq] push failed after $n attempts" && exit 1
+              echo "[haviq] push rejected — the branch moved. Rebasing (attempt $n)."
+              git pull --rebase origin dev || { \
+                echo "[haviq] REBASE CONFLICT. Someone edited the same component"; \
+                echo "[haviq] while this retrieve was running. Resolve it in HAV-IQ"; \
+                echo "[haviq] and retry — this job will not resolve it for you."; \
+                exit 1; }
+            done
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
+          HQ_BRANCH: ${{ github.ref_name }}
+          HQ_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HAVIQ_PRIVATE_KEY: ${{ secrets.HAVIQ_PRIVATE_KEY }}
+          HAVIQ_CLIENT_ID: ${{ vars.HAVIQ_CLIENT_ID }}
+          HAVIQ_USERNAME: ${{ vars.HAVIQ_USERNAME }}
+          HAVIQ_URL: ${{ vars.HAVIQ_URL }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+        run: |
+          grep -q "\[haviq-retrieve\]" /tmp/haviq_msg.txt 2>/dev/null || exit 0
+          echo "$HAVIQ_PRIVATE_KEY" > /tmp/haviq.key
+          HAVIQ_LOGIN_OUT=$(sf org login jwt --client-id "$HAVIQ_CLIENT_ID" --jwt-key-file /tmp/haviq.key --username "$HAVIQ_USERNAME" --instance-url "$HAVIQ_URL" --alias haviq-hub 2>&1) || true
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          case "$SF_TOKEN" in *[[:space:]]*) SF_TOKEN="" ;; esac
+          if [ -z "$SF_TOKEN" ]; then
+            echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
+            echo "[haviq] run's result itself within a few minutes. The JWT login said:"
+            echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
+          else
+            DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
+            MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+            BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "$HAVIQ_URL/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "[haviq] retrieve callback HTTP $HAVIQ_HTTP"
+            [ "$HAVIQ_HTTP" = "200" ] || head -c 500 /tmp/haviq_cb.out 2>/dev/null | sed "s/^/[haviq]   /" || true
+            rm -f /tmp/haviq_cb.out
+          fi
+          rm -f /tmp/haviq.key server.key /tmp/haviq_members.txt
+
+  # ── Rollback: dev1
+  rollback_dev1:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'rollback/dev1-')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: |
+          echo "${{ secrets.SF_JWT_KEY_DEV1 }}" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV1 }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV1 }} --instance-url ${{ vars.SF_ORG_URL_DEV1 }} --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - run: |
+          # OI-278 (v1.50): single sf project deploy start per rollback job
+          HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
+          HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
+          if [ "$HAS_DEL" = "1" ]; then
+            echo "Rollback: reverting (destructive + restore in one operation)..."
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --pre-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          elif [ "$HAS_PKG" = "1" ]; then
+            echo "Rollback: restoring components..."
+            sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
+          else
+            echo "Rollback: nothing to deploy (empty manifests)."
+            exit 1
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
+
+  # ── Retrieve from dev1 (RM-CI-RETRIEVE)
+  haviq_retrieve_dev1:
+    name: haviq:retrieve-dev1
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push'
+      && github.ref_name == 'dev1'
+      && contains(github.event.head_commit.message, '[haviq-retrieve]')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Retrieve and commit
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_DEV1 }}
+        run: |
+          set -e
+          git log -1 --pretty=%B > /tmp/haviq_msg.txt
+          echo "$SF_JWT_KEY" > server.key
+          sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV1 }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV1 }} --instance-url ${{ vars.SF_ORG_URL_DEV1 }} --alias haviq-source
+          if [ -f .forceignore ]; then
+            for T in $(grep -oE "<name>[A-Za-z]+</name>" manifest/haviq-retrieve.xml 2>/dev/null | sed "s/<[^>]*>//g" | sort -u); do
+              LT=$(echo "$T" | tr "[:upper:]" "[:lower:]")
+              if grep -qi "/${LT}s\?/" .forceignore; then
+                echo "[haviq] WARNING: .forceignore appears to exclude $T."
+                echo "[haviq] The CLI will write nothing for it and still exit 0."
+                echo "[haviq] Remove the matching line from .forceignore:"
+                grep -n -i "/${LT}s\?/" .forceignore | sed "s/^/[haviq]   /"
+              fi
+            done
+          fi
+          sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
+            echo "[haviq] None of the requested types exist in this org. Nothing to"
+            echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
+            exit 1
+          fi
+          sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
+          MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+          echo "[haviq] retrieved: $MEMBERS"
+          if [ -s /tmp/haviq_drop.txt ]; then
+            while IFS= read -r P; do
+              [ -z "$P" ] && continue
+              if [ -e "$P" ]; then rm -f "$P";
+              else find force-app -type f -name "${P}.*" -delete 2>/dev/null || true; fi
+            done < /tmp/haviq_drop.txt
+          fi
+          printf "%s" "$MEMBERS" > /tmp/haviq_members.txt
+          if [ -z "$MEMBERS" ]; then
+            echo "[haviq] The retrieve returned no components. Nothing will be"
+            echo "[haviq] committed — a commit here would delete the request file"
+            echo "[haviq] and report success having retrieved nothing."
+            exit 1
+          fi
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));ms=(d.get('result') or {}).get('messages') or [];ms=[ms] if isinstance(ms,dict) else ms;[print('[haviq] WARNING from retrieve: '+str(m.get('problem'))) for m in ms]" 2>/dev/null || true
+          git config user.email "ci@haviq.local"
+          git config user.name "HAV-IQ CI"
+          cp -f manifest/haviq-retrieve-keep.txt /tmp/haviq_keep.txt 2>/dev/null || true
+          rm -f manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt
+          git rm -q --cached --ignore-unmatch manifest/haviq-retrieve.xml manifest/haviq-retrieve-keep.txt >/dev/null 2>&1 || true
+          if [ -s /tmp/haviq_keep.txt ]; then
+            while IFS= read -r KD; do
+              [ -n "$KD" ] && git add -- "$KD" 2>/dev/null || true
+            done < /tmp/haviq_keep.txt
+          else
+            echo "[haviq] no keep-list in the request — refusing to guess"
+            echo "[haviq] which retrieved files are safe to commit."
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "[haviq] nothing to commit — the retrieve produced no files."
+          else
+            git commit -m "chore: HAV-IQ CI retrieve [skip ci]"
+            n=0
+            until git push origin HEAD:dev1 2>/tmp/haviq_push.err; do
+              n=$((n+1))
+              sed "s/^/[haviq]   /" /tmp/haviq_push.err || true
+              if grep -qiE "restrict|protected|permission|denied|403" /tmp/haviq_push.err; then
+                echo "[haviq] GitHub refused the push to dev1. Branch protection on it"
+                echo "[haviq] blocks the workflow's GITHUB_TOKEN. Allow GitHub Actions to push to"
+                echo "[haviq] dev1 (or exempt it from the rule), then retry the deployment."
+                exit 1
+              fi
+              [ $n -ge 3 ] && echo "[haviq] push failed after $n attempts" && exit 1
+              echo "[haviq] push rejected — the branch moved. Rebasing (attempt $n)."
+              git pull --rebase origin dev1 || { \
+                echo "[haviq] REBASE CONFLICT. Someone edited the same component"; \
+                echo "[haviq] while this retrieve was running. Resolve it in HAV-IQ"; \
+                echo "[haviq] and retry — this job will not resolve it for you."; \
+                exit 1; }
+            done
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
+          HQ_BRANCH: ${{ github.ref_name }}
+          HQ_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HAVIQ_PRIVATE_KEY: ${{ secrets.HAVIQ_PRIVATE_KEY }}
+          HAVIQ_CLIENT_ID: ${{ vars.HAVIQ_CLIENT_ID }}
+          HAVIQ_USERNAME: ${{ vars.HAVIQ_USERNAME }}
+          HAVIQ_URL: ${{ vars.HAVIQ_URL }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+        run: |
+          grep -q "\[haviq-retrieve\]" /tmp/haviq_msg.txt 2>/dev/null || exit 0
+          echo "$HAVIQ_PRIVATE_KEY" > /tmp/haviq.key
+          HAVIQ_LOGIN_OUT=$(sf org login jwt --client-id "$HAVIQ_CLIENT_ID" --jwt-key-file /tmp/haviq.key --username "$HAVIQ_USERNAME" --instance-url "$HAVIQ_URL" --alias haviq-hub 2>&1) || true
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          case "$SF_TOKEN" in *[[:space:]]*) SF_TOKEN="" ;; esac
+          if [ -z "$SF_TOKEN" ]; then
+            echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
+            echo "[haviq] run's result itself within a few minutes. The JWT login said:"
+            echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
+          else
+            DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
+            MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
+            BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "$HAVIQ_URL/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "[haviq] retrieve callback HTTP $HAVIQ_HTTP"
+            [ "$HAVIQ_HTTP" = "200" ] || head -c 500 /tmp/haviq_cb.out 2>/dev/null | sed "s/^/[haviq]   /" || true
+            rm -f /tmp/haviq_cb.out
+          fi
+          rm -f /tmp/haviq.key server.key /tmp/haviq_members.txt
+
+  # ── Feature PR → target stage (RM-Z8)
+  deploy_feature:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request'
+      && startsWith(github.head_ref, 'feature/')
+      && !contains(github.head_ref, '-resolve-')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 20
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - name: Authenticate to the PR target org
+        env:
+          HAVIQ_SECRETS: ${{ toJSON(secrets) }}
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          TGT=$(echo "$BASE_REF" | tr "[:lower:]" "[:upper:]" | sed "s/[^A-Z0-9]/_/g")
+          K=$(echo "$HAVIQ_SECRETS" | jq -r --arg k "SF_JWT_KEY_$TGT"   '.[$k] // empty')
+          C=$(echo "$HAVIQ_VARS"    | jq -r --arg k "SF_CLIENT_ID_$TGT" '.[$k] // empty')
+          U=$(echo "$HAVIQ_VARS"    | jq -r --arg k "SF_USERNAME_$TGT"  '.[$k] // empty')
+          O=$(echo "$HAVIQ_VARS"    | jq -r --arg k "SF_ORG_URL_$TGT"   '.[$k] // empty')
+          if [ -z "$K" ]; then
+            echo "Missing GitHub Actions SECRET SF_JWT_KEY_$TGT (target branch $BASE_REF)."
+            echo "HAV-IQ cannot push secrets — add it under Settings > Secrets and variables > Actions > Secrets."
+            exit 1
+          fi
+          if [ -z "$C" ] || [ -z "$U" ] || [ -z "$O" ]; then
+            echo "No SF_*_$TGT variables for target branch $BASE_REF — is it a configured stage?"; exit 1;
+          fi
+          echo "$K" > server.key
+          sf org login jwt --client-id "$C" --jwt-key-file server.key --username "$U" --instance-url "$O" --alias target
+      - name: Resolve HAV-IQ manifest
+        env:
+          HAVIQ_VARS: ${{ toJSON(vars) }}
+        run: |
+          TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
+          if [ -z "$TOK" ]; then
+            if [ -s manifest/package.xml ]; then
+              echo "No [haviq-dep:] token; falling back to the manifest on the branch."
+              exit 0
+            fi
+            echo "ERROR: no manifest on the branch and no [haviq-dep:] token in the commit message"; exit 1
+          fi
+          echo "SF_DEPLOYMENT_ID=$TOK" >> "$GITHUB_ENV"
+          # GitHub stores Actions variable names UPPERCASED, and deploy ids are
+          # mixed case — look up the uppercased name or the lookup silently misses.
+          TOK=$(echo "$TOK" | tr "[:lower:]" "[:upper:]")
+          mkdir -p manifest
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_PKG_$TOK" '.[$k] // empty' > manifest/package.xml
+          if [ ! -s manifest/package.xml ]; then echo "ERROR: variable HAVIQ_PKG_$TOK not set"; exit 1; fi
+          echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
+          echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
+      - name: Deploy to the PR target org
+        run: |
+          MSG=$(git log -20 --pretty=%B)
+          LEVEL=$(echo "$MSG" | grep -oE "\[test-level:[A-Za-z]+\]" | head -1 | sed -E "s/\[test-level:([A-Za-z]+)\]/\1/" || true)
+          if [ -z "$LEVEL" ]; then echo "$MSG" | grep -q "\[run-tests\]" && LEVEL=RunLocalTests || LEVEL=NoTestRun; fi
+          echo "$MSG" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          if [ "$LEVEL" = "RunSpecifiedTests" ]; then
+            TESTS=$(echo "$MSG" | grep -oE "\[tests:[^]]+\]" | head -1 | sed -E "s/\[tests:(.*)\]/\1/" || true)
+            TF=""; for t in $(echo "$TESTS" | tr "," " "); do TF="$TF --tests $t"; done
+            sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level RunSpecifiedTests $TF --wait 30
+          else
+            sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level "$LEVEL" --wait 30
+          fi
+      - name: Apply destructive changes
+        run: |
+          if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
+            echo "Applying destructive changes..."
+            set +e
+            DOUT=$(sf project deploy start --manifest manifest/package.xml --post-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
+            DRC=$?
+            set -e
+            echo "$DOUT"
+            if [ $DRC -ne 0 ]; then
+              ABSENT=$(echo "$DOUT" | grep -oE "No [A-Za-z]+ named:? [^ ]+ found" | sort -u)
+              OTHER=$(echo "$DOUT" | grep -iE "error|Problem" | grep -vcE "No [A-Za-z]+ named:? [^ ]+ found")
+              if [ -n "$ABSENT" ] && [ "$OTHER" -eq 0 ]; then
+                echo "[OI-317] Deletions skipped - already absent from the target org:"
+                echo "$ABSENT"
+                echo "[OI-317] The intended end state is already true. Continuing."
+                echo "$ABSENT" > /tmp/haviq-already-absent.txt
+              else
+                echo "[OI-317] Destructive deploy failed beyond already-absent components."
+                exit $DRC
+              fi
+            fi
+          else
+            echo "No destructive changes."
+          fi
+      - name: Notify HAV-IQ
+        if: always()
+        env:
+          SF_JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+          SF_BRANCH: ${{ github.head_ref || github.ref_name }}
+          SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          STATUS=$([ "$SF_JOB_STATUS" = "success" ] && echo "passed" || echo "failed")
+          ABSENT_JSON=""
+          if [ -f /tmp/haviq-already-absent.txt ]; then
+            ABSENT_JSON=$(python3 -c "import json;t=open('/tmp/haviq-already-absent.txt').read().strip();print(',\"alreadyAbsent\":'+json.dumps(t) if t else '')" 2>/dev/null || echo "")
+          fi
+          # OI-209: capture deploy failure reason from job log
+          FAILURE_REASON_JSON=""
+          if [ "$STATUS" = "failed" ]; then
+            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
+            # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
+            if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
+            FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
+          fi
+          echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
+          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          if [ -n "$SF_TOKEN" ]; then
+            if [ -n "$FAILURE_REASON_JSON" ]; then
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"failureReason\":$FAILURE_REASON_JSON,\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            else
+              BODY="{\"branch\":\"$SF_BRANCH\",\"commitSha\":\"$SF_COMMIT_SHA\",\"deploymentId\":\"$SF_DEPLOYMENT_ID\",\"status\":\"$STATUS\",\"ciRunUrl\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"$ABSENT_JSON}"
+            fi
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "${{ vars.HAVIQ_URL }}/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "HAV-IQ callback HTTP $HAVIQ_HTTP"; cat /tmp/haviq_cb.out 2>/dev/null || true
+            if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
+          fi
+          rm -f /tmp/haviq.key
