@@ -1,4 +1,0 @@
-<apex:page standardController="Account">
-    <h1>Welcome to HAV-IQ CI/CD</h1>
-    <p>Account Name: {!Account.Name}</p>
-</apex:page>
