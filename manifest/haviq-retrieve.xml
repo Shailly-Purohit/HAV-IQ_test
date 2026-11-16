@@ -10,5 +10,9 @@
         <members>HAVIQ_Cloned_Profile</members>
         <name>Profile</name>
     </types>
+    <types>
+        <members>MyTestClass</members>
+        <name>ApexClass</name>
+    </types>
     <version>62.0</version>
 </Package>
