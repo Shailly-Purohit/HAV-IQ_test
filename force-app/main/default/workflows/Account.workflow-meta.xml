@@ -6,7 +6,6 @@
         <criteriaItems>
             <field>Account.Name</field>
             <operation>notEqual</operation>
-            <value></value>
         </criteriaItems>
         <triggerType>onCreateOnly</triggerType>
     </rules>
