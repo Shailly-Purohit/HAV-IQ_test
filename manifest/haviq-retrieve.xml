@@ -7,7 +7,7 @@
 -->
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
     <types>
-        <members>HAVIQ_Cloned_Profile</members>
+        <members>Admin</members>
         <name>Profile</name>
     </types>
     <types>
