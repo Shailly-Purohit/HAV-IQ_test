@@ -3,7 +3,6 @@
     <defaultLandingTab>standard-Home</defaultLandingTab>
     <description>Sample Custom Application for HAV-IQ testing.</description>
     <formFactors>Large</formFactors>
-    <formFactors>Small</formFactors>
     <label>HAVIQ Sample App</label>
     <tabs>standard-Home</tabs>
     <tabs>standard-Account</tabs>
