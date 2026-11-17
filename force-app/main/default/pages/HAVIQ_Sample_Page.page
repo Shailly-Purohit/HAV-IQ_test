@@ -1,0 +1,4 @@
+<apex:page>
+    <h1>HAV-IQ Sample Visualforce Page</h1>
+    <p>QA to Production metadata promotion test.</p>
+</apex:page>
