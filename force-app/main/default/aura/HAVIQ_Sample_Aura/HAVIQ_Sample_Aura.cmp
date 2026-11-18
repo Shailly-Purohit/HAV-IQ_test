@@ -1,0 +1,5 @@
+<aura:component implements="flexipage:availableForAllPageTypes" access="global">
+    <lightning:card title="HAV-IQ Sample Aura Component">
+        <p class="slds-p-horizontal_small">QA to Production Aura promotion test.</p>
+    </lightning:card>
+</aura:component>
