@@ -9,6 +9,5 @@
             <type>user</type>
         </recipients>
         <senderType>CurrentUser</senderType>
-        <template>unfiled$public/SupportCaseCreatedEmailTemplate</template>
     </alerts>
 </Workflow>
