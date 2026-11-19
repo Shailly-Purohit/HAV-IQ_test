@@ -10,8 +10,12 @@ on:
       - "qa"
       - "dev"
       - "dev1"
+      - "feature/**-merge-**"
   pull_request:
     types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
 
 jobs:
 
@@ -28,12 +32,14 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -52,14 +58,32 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-472: "Validate" must validate, not deploy.
           git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level NoTestRun
       - name: Notify HAV-IQ
         if: failure()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -72,14 +96,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -102,6 +134,7 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
           if git log -1 --pretty=%B | grep -q "\[run-tests\]"; then
@@ -111,6 +144,7 @@ jobs:
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -129,14 +163,32 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-472: "Validate" must validate, not deploy.
           git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy $DCMD --manifest manifest/package.xml --target-org target
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -149,14 +201,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -184,12 +244,14 @@ jobs:
       - run: npm install -g @salesforce/cli
       - name: Authenticate to the back-promote target org
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_DEV }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV }} --instance-url ${{ vars.SF_ORG_URL_DEV }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -209,9 +271,28 @@ jobs:
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - name: Back-promote to dev
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
       - name: Apply destructive changes
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
             set +e
             DOUT=$(sf project deploy start --manifest manifest/package.xml --post-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
@@ -236,9 +317,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -251,14 +332,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -284,6 +373,7 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
           if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
@@ -296,6 +386,7 @@ jobs:
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -314,6 +405,7 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
             echo "No destructive changes for this deploy — nothing to do."; exit 0
           fi
@@ -340,9 +432,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -355,14 +447,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -389,12 +489,14 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -413,14 +515,32 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-472: "Validate" must validate, not deploy.
           git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level NoTestRun
       - name: Notify HAV-IQ
         if: failure()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -433,14 +553,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -463,6 +591,7 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
           if git log -1 --pretty=%B | grep -q "\[run-tests\]"; then
@@ -472,6 +601,7 @@ jobs:
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -490,14 +620,32 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-472: "Validate" must validate, not deploy.
           git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy $DCMD --manifest manifest/package.xml --target-org target
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -510,14 +658,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -545,12 +701,14 @@ jobs:
       - run: npm install -g @salesforce/cli
       - name: Authenticate to the back-promote target org
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_DEV1 }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV1 }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV1 }} --instance-url ${{ vars.SF_ORG_URL_DEV1 }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -570,9 +728,28 @@ jobs:
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - name: Back-promote to dev1
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
       - name: Apply destructive changes
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
             set +e
             DOUT=$(sf project deploy start --manifest manifest/package.xml --post-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
@@ -597,9 +774,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -612,14 +789,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -645,6 +830,7 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
           if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
@@ -657,6 +843,7 @@ jobs:
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -675,6 +862,7 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
             echo "No destructive changes for this deploy — nothing to do."; exit 0
           fi
@@ -701,9 +889,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -716,14 +904,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -750,12 +946,14 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -774,14 +972,32 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-472: "Validate" must validate, not deploy.
           git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level NoTestRun
       - name: Notify HAV-IQ
         if: failure()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -794,14 +1010,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -824,6 +1048,7 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
           if git log -1 --pretty=%B | grep -q "\[run-tests\]"; then
@@ -833,6 +1058,7 @@ jobs:
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -851,14 +1077,32 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-472: "Validate" must validate, not deploy.
           git log -20 --pretty=%B | grep -m1 "\[haviq\]" | grep -q "\[validate-only\]" && DCMD=validate || DCMD=start
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy $DCMD --manifest manifest/package.xml --target-org target
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -871,14 +1115,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -906,12 +1158,14 @@ jobs:
       - run: npm install -g @salesforce/cli
       - name: Authenticate to the back-promote target org
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -931,9 +1185,28 @@ jobs:
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - name: Back-promote to qa
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
+          # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+          if [ "${DCMD:-start}" = "start" ]; then (
+            set +e
+            HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+            if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+            if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+            HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+            sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+            python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+            export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+            HQ_GIT=$(git rev-parse --absolute-git-dir)
+            HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+              && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+            if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+            git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+              && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+          ) || true; fi
           sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
       - name: Apply destructive changes
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
             set +e
             DOUT=$(sf project deploy start --manifest manifest/package.xml --post-destructive-changes manifest/destructiveChanges.xml --target-org target --test-level NoTestRun --wait 30 2>&1)
@@ -958,9 +1231,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -973,14 +1246,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -1006,6 +1287,7 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
           if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
@@ -1018,6 +1300,7 @@ jobs:
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -1036,6 +1319,7 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           if [ ! -f manifest/destructiveChanges.xml ] || ! grep -q "<members>" manifest/destructiveChanges.xml; then
             echo "No destructive changes for this deploy — nothing to do."; exit 0
           fi
@@ -1062,9 +1346,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1077,14 +1361,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -1109,12 +1401,14 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_PRODUCTION }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_PRODUCTION }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_PRODUCTION }} --instance-url ${{ vars.SF_ORG_URL_PRODUCTION }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -1133,6 +1427,7 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-278 (v1.50): single sf project deploy start per rollback job
           HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
           HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
@@ -1158,6 +1453,23 @@ jobs:
             fi
           elif [ "$HAS_PKG" = "1" ]; then
             echo "Rollback: restoring components..."
+            # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+            if [ "${DCMD:-start}" = "start" ]; then (
+              set +e
+              HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+              if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+              if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+              HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+              sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+              python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+              export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+              HQ_GIT=$(git rev-parse --absolute-git-dir)
+              HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+                && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+              if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+              git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+                && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+            ) || true; fi
             sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
           else
             echo "Rollback: nothing to deploy (empty manifests)."
@@ -1165,9 +1477,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1180,14 +1492,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -1223,6 +1543,7 @@ jobs:
         env:
           SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_PRODUCTION }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           set -e
           git log -1 --pretty=%B > /tmp/haviq_msg.txt
           echo "$SF_JWT_KEY" > server.key
@@ -1239,14 +1560,14 @@ jobs:
             done
           fi
           sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
-          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];[sup.update([o['xmlName']+'Folder']+(['EmailFolder','EmailTemplateFolder'] if o['xmlName']=='EmailTemplate' else [])) for o in objs if o.get('inFolder') and o.get('xmlName')];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>64.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
           if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
             echo "[haviq] None of the requested types exist in this org. Nothing to"
             echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
             exit 1
           fi
           sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
-          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] the CLI failed: '+str(d.get('name'))+': '+str(d.get('message'))[:1500]) if d.get('status') else None;print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
           python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
           MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
           echo "[haviq] retrieved: $MEMBERS"
@@ -1279,6 +1600,15 @@ jobs:
             echo "[haviq] which retrieved files are safe to commit."
             exit 1
           fi
+          for HQ_TRY in 1 2 3 4 5; do
+            rm -rf /tmp/haviq_conv
+            sf project convert source -r force-app -d /tmp/haviq_conv --json > /tmp/haviq_conv.json 2>/dev/null && break
+            BAD=$(python3 -c "import json,re;raw=open('/tmp/haviq_conv.json').read();raw=raw[raw.find(chr(123)):] if chr(123) in raw else '{}';m=re.search(r'(force-app/\S+-meta\.xml): Expected source files', json.loads(raw).get('message') or '');print(m.group(1) if m else '')" 2>/dev/null)
+            [ -z "$BAD" ] && break
+            echo "[haviq] not committing $BAD — Salesforce did not export its content (a certificate key is never exported)."
+            git rm -q --cached --ignore-unmatch -- "$BAD" >/dev/null 2>&1 || true
+            rm -f -- "$BAD"
+          done
           if git diff --cached --quiet; then
             echo "[haviq] nothing to commit — the retrieve produced no files."
           else
@@ -1304,6 +1634,7 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
           HQ_BRANCH: ${{ github.ref_name }}
@@ -1323,7 +1654,8 @@ jobs:
             echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
             echo "[haviq] run's result itself within a few minutes. The JWT login said:"
             echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
-          else
+          fi
+          if [ -n "$SF_TOKEN" ]; then
             DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
             MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
             BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
@@ -1345,12 +1677,14 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_QA }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_QA }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_QA }} --instance-url ${{ vars.SF_ORG_URL_QA }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -1369,6 +1703,7 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-278 (v1.50): single sf project deploy start per rollback job
           HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
           HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
@@ -1394,6 +1729,23 @@ jobs:
             fi
           elif [ "$HAS_PKG" = "1" ]; then
             echo "Rollback: restoring components..."
+            # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+            if [ "${DCMD:-start}" = "start" ]; then (
+              set +e
+              HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+              if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+              if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+              HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+              sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+              python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+              export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+              HQ_GIT=$(git rev-parse --absolute-git-dir)
+              HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+                && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+              if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+              git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+                && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+            ) || true; fi
             sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
           else
             echo "Rollback: nothing to deploy (empty manifests)."
@@ -1401,9 +1753,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1416,14 +1768,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -1459,6 +1819,7 @@ jobs:
         env:
           SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_QA }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           set -e
           git log -1 --pretty=%B > /tmp/haviq_msg.txt
           echo "$SF_JWT_KEY" > server.key
@@ -1475,14 +1836,14 @@ jobs:
             done
           fi
           sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
-          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];[sup.update([o['xmlName']+'Folder']+(['EmailFolder','EmailTemplateFolder'] if o['xmlName']=='EmailTemplate' else [])) for o in objs if o.get('inFolder') and o.get('xmlName')];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>64.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
           if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
             echo "[haviq] None of the requested types exist in this org. Nothing to"
             echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
             exit 1
           fi
           sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
-          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] the CLI failed: '+str(d.get('name'))+': '+str(d.get('message'))[:1500]) if d.get('status') else None;print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
           python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
           MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
           echo "[haviq] retrieved: $MEMBERS"
@@ -1515,6 +1876,15 @@ jobs:
             echo "[haviq] which retrieved files are safe to commit."
             exit 1
           fi
+          for HQ_TRY in 1 2 3 4 5; do
+            rm -rf /tmp/haviq_conv
+            sf project convert source -r force-app -d /tmp/haviq_conv --json > /tmp/haviq_conv.json 2>/dev/null && break
+            BAD=$(python3 -c "import json,re;raw=open('/tmp/haviq_conv.json').read();raw=raw[raw.find(chr(123)):] if chr(123) in raw else '{}';m=re.search(r'(force-app/\S+-meta\.xml): Expected source files', json.loads(raw).get('message') or '');print(m.group(1) if m else '')" 2>/dev/null)
+            [ -z "$BAD" ] && break
+            echo "[haviq] not committing $BAD — Salesforce did not export its content (a certificate key is never exported)."
+            git rm -q --cached --ignore-unmatch -- "$BAD" >/dev/null 2>&1 || true
+            rm -f -- "$BAD"
+          done
           if git diff --cached --quiet; then
             echo "[haviq] nothing to commit — the retrieve produced no files."
           else
@@ -1540,6 +1910,7 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
           HQ_BRANCH: ${{ github.ref_name }}
@@ -1559,7 +1930,8 @@ jobs:
             echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
             echo "[haviq] run's result itself within a few minutes. The JWT login said:"
             echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
-          else
+          fi
+          if [ -n "$SF_TOKEN" ]; then
             DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
             MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
             BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
@@ -1581,12 +1953,14 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_DEV }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV }} --instance-url ${{ vars.SF_ORG_URL_DEV }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -1605,6 +1979,7 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-278 (v1.50): single sf project deploy start per rollback job
           HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
           HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
@@ -1630,6 +2005,23 @@ jobs:
             fi
           elif [ "$HAS_PKG" = "1" ]; then
             echo "Rollback: restoring components..."
+            # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+            if [ "${DCMD:-start}" = "start" ]; then (
+              set +e
+              HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+              if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+              if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+              HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+              sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+              python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+              export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+              HQ_GIT=$(git rev-parse --absolute-git-dir)
+              HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+                && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+              if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+              git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+                && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+            ) || true; fi
             sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
           else
             echo "Rollback: nothing to deploy (empty manifests)."
@@ -1637,9 +2029,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1652,14 +2044,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -1695,6 +2095,7 @@ jobs:
         env:
           SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_DEV }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           set -e
           git log -1 --pretty=%B > /tmp/haviq_msg.txt
           echo "$SF_JWT_KEY" > server.key
@@ -1711,14 +2112,14 @@ jobs:
             done
           fi
           sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
-          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];[sup.update([o['xmlName']+'Folder']+(['EmailFolder','EmailTemplateFolder'] if o['xmlName']=='EmailTemplate' else [])) for o in objs if o.get('inFolder') and o.get('xmlName')];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>64.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
           if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
             echo "[haviq] None of the requested types exist in this org. Nothing to"
             echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
             exit 1
           fi
           sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
-          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] the CLI failed: '+str(d.get('name'))+': '+str(d.get('message'))[:1500]) if d.get('status') else None;print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
           python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
           MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
           echo "[haviq] retrieved: $MEMBERS"
@@ -1751,6 +2152,15 @@ jobs:
             echo "[haviq] which retrieved files are safe to commit."
             exit 1
           fi
+          for HQ_TRY in 1 2 3 4 5; do
+            rm -rf /tmp/haviq_conv
+            sf project convert source -r force-app -d /tmp/haviq_conv --json > /tmp/haviq_conv.json 2>/dev/null && break
+            BAD=$(python3 -c "import json,re;raw=open('/tmp/haviq_conv.json').read();raw=raw[raw.find(chr(123)):] if chr(123) in raw else '{}';m=re.search(r'(force-app/\S+-meta\.xml): Expected source files', json.loads(raw).get('message') or '');print(m.group(1) if m else '')" 2>/dev/null)
+            [ -z "$BAD" ] && break
+            echo "[haviq] not committing $BAD — Salesforce did not export its content (a certificate key is never exported)."
+            git rm -q --cached --ignore-unmatch -- "$BAD" >/dev/null 2>&1 || true
+            rm -f -- "$BAD"
+          done
           if git diff --cached --quiet; then
             echo "[haviq] nothing to commit — the retrieve produced no files."
           else
@@ -1776,6 +2186,7 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
           HQ_BRANCH: ${{ github.ref_name }}
@@ -1795,7 +2206,8 @@ jobs:
             echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
             echo "[haviq] run's result itself within a few minutes. The JWT login said:"
             echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
-          else
+          fi
+          if [ -n "$SF_TOKEN" ]; then
             DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
             MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
             BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
@@ -1817,12 +2229,14 @@ jobs:
           node-version: '22'
       - run: npm install -g @salesforce/cli
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           echo "${{ secrets.SF_JWT_KEY_DEV1 }}" > server.key
           sf org login jwt --client-id ${{ vars.SF_CLIENT_ID_DEV1 }} --jwt-key-file server.key --username ${{ vars.SF_USERNAME_DEV1 }} --instance-url ${{ vars.SF_ORG_URL_DEV1 }} --alias target
       - name: Resolve HAV-IQ manifest
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -1841,6 +2255,7 @@ jobs:
           echo "$HAVIQ_VARS" | jq -r --arg k "HAVIQ_DESTRUCTIVE_$TOK" '.[$k] // empty' > manifest/destructiveChanges.xml
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           # OI-278 (v1.50): single sf project deploy start per rollback job
           HAS_DEL=$( [ -f manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml && echo 1 || echo 0 )
           HAS_PKG=$( [ -f manifest/package.xml ] && grep -q "<members>" manifest/package.xml && echo 1 || echo 0 )
@@ -1866,6 +2281,23 @@ jobs:
             fi
           elif [ "$HAS_PKG" = "1" ]; then
             echo "Rollback: restoring components..."
+            # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+            if [ "${DCMD:-start}" = "start" ]; then (
+              set +e
+              HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+              if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+              if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+              HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+              sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+              python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+              export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+              HQ_GIT=$(git rev-parse --absolute-git-dir)
+              HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+                && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+              if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+              git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+                && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+            ) || true; fi
             sf project deploy start --manifest manifest/package.xml --target-org target --test-level NoTestRun --wait 30
           else
             echo "Rollback: nothing to deploy (empty manifests)."
@@ -1873,9 +2305,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1888,14 +2320,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -1931,6 +2371,7 @@ jobs:
         env:
           SF_JWT_KEY: ${{ secrets.SF_JWT_KEY_DEV1 }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           set -e
           git log -1 --pretty=%B > /tmp/haviq_msg.txt
           echo "$SF_JWT_KEY" > server.key
@@ -1947,14 +2388,14 @@ jobs:
             done
           fi
           sf org list metadata-types --target-org haviq-source --json > /tmp/haviq_mdtypes.json 2>&1 || true
-          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>62.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
+          python3 -c "import json,re;raw=open('/tmp/haviq_mdtypes.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';objs=(json.loads(raw).get('result') or {}).get('metadataObjects') or [];sup=set();[sup.add(o['xmlName']) for o in objs if o.get('xmlName')];[sup.add(c) for o in objs for c in (o.get('childXmlNames') or [])];[sup.update([o['xmlName']+'Folder']+(['EmailFolder','EmailTemplateFolder'] if o['xmlName']=='EmailTemplate' else [])) for o in objs if o.get('inFolder') and o.get('xmlName')];src=open('manifest/haviq-retrieve.xml').read();blocks=re.findall(r'<types>.*?</types>', src, re.S);nm=lambda b:(re.search(r'<name>(.*?)</name>', b) or [None,''])[1];keep=[b for b in blocks if not sup or nm(b) in sup];drop=sorted(nm(b) for b in blocks if sup and nm(b) not in sup);v=re.search(r'<version>.*?</version>', src);open('/tmp/haviq_manifest.xml','w').write('<?xml version=\"1.0\" encoding=\"UTF-8\"?>' + chr(10) + '<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">' + chr(10) + chr(10).join(keep) + chr(10) + (v.group(0) if v else '<version>64.0</version>') + chr(10) + '</Package>');print('[haviq] types asked for: '+str(len(blocks))+', supported by this org: '+str(len(keep))+', not available here: '+str(len(drop)));print('[haviq] not in this org: '+','.join(drop[:25])+(' and more' if len(drop)>25 else '')) if drop else None;print('[haviq] NOTE: could not read the org type list; asking for everything') if not sup else None" || cp -f manifest/haviq-retrieve.xml /tmp/haviq_manifest.xml
           if ! grep -q "<name>" /tmp/haviq_manifest.xml 2>/dev/null; then
             echo "[haviq] None of the requested types exist in this org. Nothing to"
             echo "[haviq] retrieve. Narrow My Scope to types this org actually has."
             exit 1
           fi
           sf project retrieve start --manifest /tmp/haviq_manifest.xml --target-org haviq-source --wait 30 --json > /tmp/haviq_retrieve.json || true
-          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
+          python3 -c "import json;d=json.load(open('/tmp/haviq_retrieve.json'));r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties');print('[haviq] the CLI failed: '+str(d.get('name'))+': '+str(d.get('message'))[:1500]) if d.get('status') else None;print('[haviq] retrieve did not return files. Full result below.') if not rows else None;print('[haviq] '+json.dumps({k:v for k,v in r.items() if k not in ('files','fileProperties')})[:1500]) if not rows else None" 2>/dev/null || echo "[haviq] retrieve produced no readable JSON at all"
           python3 -c "import json;raw=open('/tmp/haviq_retrieve.json').read();raw=raw[raw.index(chr(123)):] if chr(123) in raw else '{}';d=json.loads(raw); r=d.get('result') or {};rows=r.get('files') or r.get('fileProperties') or [];S=set(['c','e','mdt','b','x','kav','Share','History','Feed','ChangeEvent','r']);nsp=lambda n:(lambda p: len(p)>1 and not (len(p)==2 and p[1] in S))(n.replace('-','.').split('.')[-1].split('__'));man=lambda f: bool(f.get('namespacePrefix')) or (f.get('manageableState') not in (None,'unmanaged')) or nsp(f.get('fullName',''));ok=[f for f in rows if f.get('type') and f.get('fullName') and str(f.get('state','')).lower()!='failed' and not man(f)];mg=[f for f in rows if man(f)];open('/tmp/haviq_members.txt','w').write(','.join(sorted(set(f['type']+':'+f['fullName'] for f in ok))));open('/tmp/haviq_drop.txt','w').write(chr(10).join(f.get('filePath') or f.get('fullName') for f in mg));print('[haviq] managed components excluded: '+str(len(mg))+' of '+str(len(rows)))" 2>/dev/null || printf "" > /tmp/haviq_members.txt
           MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
           echo "[haviq] retrieved: $MEMBERS"
@@ -1987,6 +2428,15 @@ jobs:
             echo "[haviq] which retrieved files are safe to commit."
             exit 1
           fi
+          for HQ_TRY in 1 2 3 4 5; do
+            rm -rf /tmp/haviq_conv
+            sf project convert source -r force-app -d /tmp/haviq_conv --json > /tmp/haviq_conv.json 2>/dev/null && break
+            BAD=$(python3 -c "import json,re;raw=open('/tmp/haviq_conv.json').read();raw=raw[raw.find(chr(123)):] if chr(123) in raw else '{}';m=re.search(r'(force-app/\S+-meta\.xml): Expected source files', json.loads(raw).get('message') or '');print(m.group(1) if m else '')" 2>/dev/null)
+            [ -z "$BAD" ] && break
+            echo "[haviq] not committing $BAD — Salesforce did not export its content (a certificate key is never exported)."
+            git rm -q --cached --ignore-unmatch -- "$BAD" >/dev/null 2>&1 || true
+            rm -f -- "$BAD"
+          done
           if git diff --cached --quiet; then
             echo "[haviq] nothing to commit — the retrieve produced no files."
           else
@@ -2012,6 +2462,7 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
           HQ_BRANCH: ${{ github.ref_name }}
@@ -2031,7 +2482,8 @@ jobs:
             echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
             echo "[haviq] run's result itself within a few minutes. The JWT login said:"
             echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
-          else
+          fi
+          if [ -n "$SF_TOKEN" ]; then
             DEPID=$(sed -n "s/.*for deployment \([a-zA-Z0-9]*\).*/\1/p" /tmp/haviq_msg.txt | head -1)
             MEMBERS=$(cat /tmp/haviq_members.txt 2>/dev/null || echo "")
             BODY="{\"phase\":\"retrieve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"retrievedMembers\":\"$MEMBERS\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
@@ -2064,6 +2516,7 @@ jobs:
           HAVIQ_VARS: ${{ toJSON(vars) }}
           BASE_REF: ${{ github.base_ref }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TGT=$(echo "$BASE_REF" | tr "[:lower:]" "[:upper:]" | sed "s/[^A-Z0-9]/_/g")
           K=$(echo "$HAVIQ_SECRETS" | jq -r --arg k "SF_JWT_KEY_$TGT"   '.[$k] // empty')
           C=$(echo "$HAVIQ_VARS"    | jq -r --arg k "SF_CLIENT_ID_$TGT" '.[$k] // empty')
@@ -2083,6 +2536,7 @@ jobs:
         env:
           HAVIQ_VARS: ${{ toJSON(vars) }}
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           TOK=$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")
           if [ -z "$TOK" ]; then
             if [ -s manifest/package.xml ]; then
@@ -2102,6 +2556,7 @@ jobs:
           echo "[OI-292] manifest (dep $TOK):"; cat manifest/package.xml
       - name: Deploy to the PR target org
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           MSG=$(git log -20 --pretty=%B)
           LEVEL=$(echo "$MSG" | grep -oE "\[test-level:[A-Za-z]+\]" | head -1 | sed -E "s/\[test-level:([A-Za-z]+)\]/\1/" || true)
           if [ -z "$LEVEL" ]; then echo "$MSG" | grep -q "\[run-tests\]" && LEVEL=RunLocalTests || LEVEL=NoTestRun; fi
@@ -2109,12 +2564,47 @@ jobs:
           if [ "$LEVEL" = "RunSpecifiedTests" ]; then
             TESTS=$(echo "$MSG" | grep -oE "\[tests:[^]]+\]" | head -1 | sed -E "s/\[tests:(.*)\]/\1/" || true)
             TF=""; for t in $(echo "$TESTS" | tr "," " "); do TF="$TF --tests $t"; done
+            # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+            if [ "${DCMD:-start}" = "start" ]; then (
+              set +e
+              HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+              if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+              if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+              HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+              sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+              python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+              export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+              HQ_GIT=$(git rev-parse --absolute-git-dir)
+              HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+                && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+              if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+              git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+                && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+            ) || true; fi
             sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level RunSpecifiedTests $TF --wait 30
           else
+            # RM-ROLLBACK-BY-TARGET-STATE: save what the target holds before this deploy changes it.
+            if [ "${DCMD:-start}" = "start" ]; then (
+              set +e
+              HQ_DEP="${SF_DEPLOYMENT_ID:-$(git log -20 --pretty=%B | grep -oE "\[haviq-dep:[A-Za-z0-9]+\]" | head -1 | sed -E "s/.*:([A-Za-z0-9]+)\]/\1/")}"
+              if [ -z "$HQ_DEP" ]; then echo "[haviq] pre-deploy versions not captured: no deployment id in the commit"; exit 0; fi
+              if git ls-remote --tags origin "refs/tags/hq-pre-$HQ_DEP" 2>/dev/null | grep -q .; then echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP (by an earlier run)"; exit 0; fi
+              HQ_PRE=$(mktemp -d); HQ_OUT="hq-pre-$HQ_DEP"; trap 'rm -rf "$HQ_OUT"' EXIT
+              sf project retrieve start --manifest manifest/package.xml --target-org target --output-dir "$HQ_OUT" --json > "$HQ_PRE/r.json" 2>/dev/null
+              python3 -c "import json,sys,os; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; sys.exit(1) if d.get('status',1)!=0 else None; out=os.path.realpath(sys.argv[4]); fs=[f for f in (r.get('files') or []) if f.get('state')!='Failed' and f.get('filePath')]; lm={(p.get('type'),p.get('fullName')):p.get('lastModifiedDate') for p in (r.get('fileProperties') or [])}; ks=list(dict.fromkeys([(f.get('type'),f.get('fullName')) for f in fs]+[k for k in lm if k[0]])); c=[{'type':t,'fullName':n,'lastModifiedDate':lm.get((t,n)),'files':sorted(os.path.relpath(os.path.realpath(f['filePath']),out) for f in fs if f.get('type')==t and f.get('fullName')==n)} for (t,n) in ks if t and t!='Package']; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); json.dump({'deployment':sys.argv[3],'components':c},open(sys.argv[2],'w'),indent=1)" "$HQ_PRE/r.json" "$HQ_OUT/manifest/haviq-pre-state.json" "$HQ_DEP" "$HQ_OUT" || { echo "[haviq] pre-deploy versions not captured: the retrieve from the target failed"; exit 0; }
+              export GIT_INDEX_FILE="$HQ_PRE/idx" GIT_AUTHOR_NAME=HAV-IQ GIT_AUTHOR_EMAIL=noreply@haviq.io GIT_COMMITTER_NAME=HAV-IQ GIT_COMMITTER_EMAIL=noreply@haviq.io
+              HQ_GIT=$(git rev-parse --absolute-git-dir)
+              HQ_C=$(cd "$HQ_OUT" && git --git-dir="$HQ_GIT" --work-tree=. add -A . && HQ_TREE=$(git --git-dir="$HQ_GIT" write-tree) \
+                && git --git-dir="$HQ_GIT" commit-tree "$HQ_TREE" -m "[skip ci] [haviq-pre:$HQ_DEP]")
+              if [ -z "$HQ_C" ]; then echo "[haviq] pre-deploy versions not captured: could not build the capture commit"; exit 0; fi
+              git push -q origin "$HQ_C:refs/tags/hq-pre-$HQ_DEP" 2>/dev/null \
+                && echo "[haviq] pre-deploy versions captured: hq-pre-$HQ_DEP" || echo "[haviq] pre-deploy versions not captured: could not push tag hq-pre-$HQ_DEP"
+            ) || true; fi
             sf project deploy $DCMD --manifest manifest/package.xml --target-org target --test-level "$LEVEL" --wait 30
           fi
       - name: Apply destructive changes
         run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
           if [ -s manifest/destructiveChanges.xml ] && grep -q "<members>" manifest/destructiveChanges.xml; then
             echo "Applying destructive changes..."
             set +e
@@ -2140,9 +2630,9 @@ jobs:
           fi
       - name: Notify HAV-IQ
         if: always()
+        continue-on-error: true
         env:
           SF_JOB_STATUS: ${{ job.status }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
           SF_BRANCH: ${{ github.head_ref || github.ref_name }}
           SF_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -2155,14 +2645,22 @@ jobs:
           # OI-209: capture deploy failure reason from job log
           FAILURE_REASON_JSON=""
           if [ "$STATUS" = "failed" ]; then
-            TRACE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/jobs/${{ github.job }}/logs" 2>/dev/null || echo "")
+            TRACE=$(cat /tmp/haviq-step.log 2>/dev/null || echo "")
+            if [ -z "$TRACE" ]; then echo "[haviq] captured step log is empty; the failure reason will be blank."; fi
             MATCHED=$(echo "$TRACE" | grep -E "Problem|No such column|Variable does not exist|Component Failures|FAILED|✘" | head -40)
             # Fallback: a fixed keyword list always misses the next novel error — keep the trace tail so the reason is never blank.
             if [ -z "$MATCHED" ]; then MATCHED=$(echo "$TRACE" | grep -v "^[[:space:]]*$" | tail -40); fi
             FAILURE_REASON_JSON=$(echo "$MATCHED" | sed "s/\x1b\[[0-9;]*m//g" | head -c 30000 | python3 -c "import sys,json;t=sys.stdin.read().strip();print(json.dumps(t) if t else \"\")" 2>/dev/null || echo "")
           fi
           echo "${{ secrets.HAVIQ_PRIVATE_KEY }}" > /tmp/haviq.key
-          sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub
+          if ! sf org login jwt --client-id "${{ vars.HAVIQ_CLIENT_ID }}" --jwt-key-file /tmp/haviq.key --username "${{ vars.HAVIQ_USERNAME }}" --instance-url "${{ vars.HAVIQ_URL }}" --alias haviq-hub > /tmp/haviq_login.out 2>&1; then
+            echo "[haviq] Could not log in to HAV-IQ to report this result. The deploy result above is unaffected:"
+            echo "[haviq] HAV-IQ reads it by polling instead, a few minutes later. To fix reporting, set the"
+            echo "[haviq] pipeline's Self-Auth tab, click Regenerate CI YAML, and check the HAVIQ_PRIVATE_KEY secret."
+            sed "s/^/[haviq]   /" /tmp/haviq_login.out | head -5
+            rm -f /tmp/haviq.key
+            exit 0
+          fi
           SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
           if [ -n "$SF_TOKEN" ]; then
             if [ -n "$FAILURE_REASON_JSON" ]; then
@@ -2175,3 +2673,103 @@ jobs:
             if [ "$HAVIQ_HTTP" = "401" ]; then echo "Callback rejected: check the SF_WEBHOOK_SECRET repository secret matches the pipeline webhook secret."; fi
           fi
           rm -f /tmp/haviq.key
+
+  # ── Record a resolved conflict as a real merge (OI-605)
+  haviq_resolve:
+    name: haviq:resolve-merge
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push'
+      && contains(github.ref_name, '-merge-')
+      && contains(github.event.head_commit.message, '[haviq-resolve]')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge the Work Item branch with the HAV-IQ resolution
+        env:
+          HQ_BRANCH: ${{ github.ref_name }}
+        run: |
+          HQ_FIFO=$(mktemp -u); mkfifo "$HQ_FIFO"; tee -a /tmp/haviq-step.log < "$HQ_FIFO" & HQ_TEE=$!; exec > "$HQ_FIFO" 2>&1; rm -f "$HQ_FIFO"; trap 'HQ_RC=$?; exec >&- 2>&-; wait $HQ_TEE; exit $HQ_RC' EXIT
+          git log -1 --pretty=%B > /tmp/haviq_msg.txt
+          if ! grep -q "\[haviq-resolve\]" /tmp/haviq_msg.txt; then
+            echo "[haviq] Not a HAV-IQ resolve request; nothing to do."
+            exit 0
+          fi
+          set -e
+          git config user.email "ci@haviq.local"
+          git config user.name "HAV-IQ CI"
+          git fetch --unshallow origin >/dev/null 2>&1 || true
+          WI=$(python3 -c "import json;print(json.load(open('manifest/haviq-resolve.json'))['workItemBranch'])")
+          case "$WI" in ""|*..*|*[!A-Za-z0-9._/-]*) echo "[haviq] The request names an unsafe branch; stopping."; exit 1 ;; esac
+          python3 -c "import json;[print(p) for p in json.load(open('manifest/haviq-resolve.json'))['conflictPaths']]" > /tmp/haviq_conflicts.txt
+          git fetch origin "+refs/heads/$WI:refs/remotes/origin/$WI"
+          git merge --no-ff --no-commit "origin/$WI" > /tmp/haviq_merge.out 2>&1 || true
+          while IFS= read -r P; do
+            [ -z "$P" ] && continue
+            git checkout --ours -- "$P" 2>/dev/null && git add -- "$P" || git rm -q --cached --ignore-unmatch -- "$P"
+          done < /tmp/haviq_conflicts.txt
+          for P in $(git diff --name-only --diff-filter=U); do
+            case "$P" in .gitlab-ci.yml|bitbucket-pipelines.yml|.github/workflows/*) git checkout --ours -- "$P"; git add -- "$P" ;; esac
+          done
+          LEFT=$(git diff --name-only --diff-filter=U)
+          if [ -n "$LEFT" ]; then
+            echo "[haviq] These files also conflict, and were not resolved in HAV-IQ:"
+            echo "$LEFT" | sed "s/^/[haviq]   /"
+            echo "[haviq] Nothing was pushed. Resolve them in HAV-IQ (Tracker → Resolve Conflicts) and resume."
+            printf "%s" "$LEFT" | tr "\n" "," > /tmp/haviq_unresolved.txt
+            git merge --abort || true
+            exit 1
+          fi
+          git rm -q --ignore-unmatch manifest/haviq-resolve.json
+          sed "s/ \[haviq-resolve\]//" /tmp/haviq_msg.txt > /tmp/haviq_merge_msg.txt
+          git commit -q -F /tmp/haviq_merge_msg.txt
+          if ! git push origin "HEAD:$HQ_BRANCH" 2>/tmp/haviq_push.err; then
+            sed "s/^/[haviq]   /" /tmp/haviq_push.err || true
+            echo "[haviq] The push to $HQ_BRANCH was refused. Nothing was deployed; retry the deployment."
+            exit 1
+          fi
+          git rev-parse HEAD > /tmp/haviq_head.txt
+          echo "[haviq] Merged $WI into $HQ_BRANCH with the resolution from HAV-IQ."
+      - uses: actions/setup-node@v4
+        if: always()
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+        if: always()
+      - name: Notify HAV-IQ
+        if: always()
+        continue-on-error: true
+        env:
+          HQ_STATUS: ${{ job.status == 'success' && 'success' || 'failed' }}
+          HQ_BRANCH: ${{ github.ref_name }}
+          HQ_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HAVIQ_PRIVATE_KEY: ${{ secrets.HAVIQ_PRIVATE_KEY }}
+          HAVIQ_CLIENT_ID: ${{ vars.HAVIQ_CLIENT_ID }}
+          HAVIQ_USERNAME: ${{ vars.HAVIQ_USERNAME }}
+          HAVIQ_URL: ${{ vars.HAVIQ_URL }}
+          SF_WEBHOOK_SECRET: ${{ secrets.SF_WEBHOOK_SECRET }}
+        run: |
+          grep -q "\[haviq-resolve\]" /tmp/haviq_msg.txt 2>/dev/null || exit 0
+          echo "$HAVIQ_PRIVATE_KEY" > /tmp/haviq.key
+          HAVIQ_LOGIN_OUT=$(sf org login jwt --client-id "$HAVIQ_CLIENT_ID" --jwt-key-file /tmp/haviq.key --username "$HAVIQ_USERNAME" --instance-url "$HAVIQ_URL" --alias haviq-hub 2>&1) || true
+          SF_TOKEN=$(sf org auth show-access-token --target-org haviq-hub --json 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['result']['accessToken'])" 2>/dev/null || echo "")
+          case "$SF_TOKEN" in *[[:space:]]*) SF_TOKEN="" ;; esac
+          if [ -z "$SF_TOKEN" ]; then
+            echo "[haviq] callback SKIPPED — no access token. HAV-IQ will read this"
+            echo "[haviq] run's result itself within a few minutes. The JWT login said:"
+            echo "$HAVIQ_LOGIN_OUT" | head -6 | sed "s/^/[haviq]   /"
+          fi
+          if [ -n "$SF_TOKEN" ]; then
+            DEPID=$(sed -n "s/.*\[haviq-dep:\([a-zA-Z0-9]*\)\].*/\1/p" /tmp/haviq_msg.txt | head -1)
+            HEADSHA=$(cat /tmp/haviq_head.txt 2>/dev/null || echo "")
+            UNRESOLVED=$(cat /tmp/haviq_unresolved.txt 2>/dev/null || echo "")
+            BODY="{\"phase\":\"resolve\",\"deploymentId\":\"$DEPID\",\"branch\":\"$HQ_BRANCH\",\"status\":\"$HQ_STATUS\",\"commitSha\":\"$HEADSHA\",\"unresolvedFiles\":\"$UNRESOLVED\",\"ciRunUrl\":\"$HQ_RUN_URL\"}"
+            HAVIQ_HTTP=$(curl -s -o /tmp/haviq_cb.out -w "%{http_code}" -X POST "$HAVIQ_URL/services/apexrest/haviq/pipeline/webhook" -H "Authorization: Bearer $SF_TOKEN" -H "Content-Type: application/json" -H "x-sf-devops-secret: $SF_WEBHOOK_SECRET" -d "$BODY" || echo "000")
+            echo "[haviq] resolve callback HTTP $HAVIQ_HTTP"
+            [ "$HAVIQ_HTTP" = "200" ] || head -c 500 /tmp/haviq_cb.out 2>/dev/null | sed "s/^/[haviq]   /" || true
+            rm -f /tmp/haviq_cb.out
+          fi
+          rm -f /tmp/haviq.key /tmp/haviq_head.txt /tmp/haviq_unresolved.txt
