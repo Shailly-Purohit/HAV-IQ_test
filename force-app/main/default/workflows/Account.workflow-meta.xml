@@ -5,8 +5,7 @@
         <description>Sample Workflow Alert for QA to Production testing</description>
         <protected>false</protected>
         <recipients>
-            <recipient>shoilypurohit180.a48c3e5281d8@agentforce.com</recipient>
-            <type>user</type>
+            <type>owner</type>
         </recipients>
         <senderType>CurrentUser</senderType>
         <template>unfiled$public/MarketingProductInquiryResponse</template>
