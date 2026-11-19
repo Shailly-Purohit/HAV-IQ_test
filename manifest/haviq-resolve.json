@@ -1,0 +1,4 @@
+{
+  "conflictPaths" : [ "force-app/main/default/workflows/Account.workflow-meta.xml" ],
+  "workItemBranch" : "feature/workflow-alert-prod003"
+}
