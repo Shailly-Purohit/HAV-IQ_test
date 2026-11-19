@@ -8,5 +8,4 @@
     <label>HAVIQ Sample App</label>
     <navType>Standard</navType>
     <tabs>standard-Account</tabs>
-    <uiType>Lightning</uiType>
 </CustomApplication>
