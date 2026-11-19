@@ -1,0 +1,13 @@
+{
+ "deployment": "a06fj00000QPE8rAAH",
+ "components": [
+  {
+   "type": "Workflow",
+   "fullName": "Account",
+   "lastModifiedDate": "2026-11-19T14:53:37.270Z",
+   "files": [
+    "workflows/Account.workflow-meta.xml"
+   ]
+  }
+ ]
+}
