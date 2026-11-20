@@ -1,1 +1,1 @@
-force-app/main/default/labels
+force-app/main/default/profiles
