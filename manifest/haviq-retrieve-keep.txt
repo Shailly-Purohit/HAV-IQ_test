@@ -1,1 +1,1 @@
-force-app/main/default/profiles
+force-app/main/default/objects/Sample_Project__c
