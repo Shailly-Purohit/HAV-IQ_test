@@ -10,4 +10,11 @@
         <senderType>CurrentUser</senderType>
         <template>unfiled$public/SupportCaseResponse</template>
     </alerts>
+    <rules>
+        <fullName>Sample_Account_Workflow</fullName>
+        <active>true</active>
+        <description>Sample workflow rule for metadata deployment testing</description>
+        <formula>AnnualRevenue &gt; 0</formula>
+        <triggerType>onAllChanges</triggerType>
+    </rules>
 </Workflow>
