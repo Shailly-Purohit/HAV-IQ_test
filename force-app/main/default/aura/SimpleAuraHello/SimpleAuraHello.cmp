@@ -1,0 +1,4 @@
+<aura:component implements="flexipage:availableForAllPageTypes" access="global">
+    <h1>Hello from Aura!</h1>
+    <p>My first Aura component.</p>
+</aura:component>
