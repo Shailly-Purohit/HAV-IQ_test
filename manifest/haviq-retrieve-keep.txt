@@ -1,1 +1,1 @@
-force-app/main/default/objects/SampleConfig__mdt
+force-app/main/default/tabs

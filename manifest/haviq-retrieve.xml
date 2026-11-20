@@ -7,8 +7,8 @@
 -->
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
     <types>
-        <members>SampleConfig__mdt</members>
-        <name>CustomObject</name>
+        <members>haviq__Haviq_Regression_Run__c</members>
+        <name>CustomTab</name>
     </types>
     <version>64.0</version>
 </Package>
