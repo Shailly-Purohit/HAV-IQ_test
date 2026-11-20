@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>68.0</apiVersion>
+    <description>it&apos;s a test</description>
+    <environments>Default</environments>
+    <interviewLabel>Simple_Test_Flow {!$Flow.CurrentDateTime}</interviewLabel>
+    <label>Simple_Test_Flow</label>
+    <processMetadataValues>
+        <name>BuilderType</name>
+        <value>
+            <stringValue>LightningFlowBuilder</stringValue>
+        </value>
+    </processMetadataValues>
+    <processMetadataValues>
+        <name>CanvasMode</name>
+        <value>
+            <stringValue>AUTO_LAYOUT_CANVAS</stringValue>
+        </value>
+    </processMetadataValues>
+    <processMetadataValues>
+        <name>OriginBuilderType</name>
+        <value>
+            <stringValue>LightningFlowBuilder</stringValue>
+        </value>
+    </processMetadataValues>
+    <processType>Flow</processType>
+    <screens>
+        <allowBack>true</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>true</allowPause>
+        <fields>
+            <fieldText>&lt;p&gt;&lt;code&gt;Hello! This is my first Salesforce Flow&lt;/code&gt;&lt;/p&gt;</fieldText>
+            <fieldType>DisplayText</fieldType>
+            <name>Welcome_Message</name>
+        </fields>
+        <label>Simple Test Screen</label>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+        <name>Simple_Test_Screen</name>
+        <showFooter>true</showFooter>
+        <showHeader>true</showHeader>
+    </screens>
+    <start>
+        <connector>
+            <targetReference>Simple_Test_Screen</targetReference>
+        </connector>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+    </start>
+    <status>Active</status>
+</Flow>
