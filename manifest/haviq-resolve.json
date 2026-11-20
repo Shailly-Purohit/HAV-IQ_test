@@ -1,0 +1,4 @@
+{
+  "conflictPaths" : [ "force-app/main/default/workflows/Account.workflow-meta.xml" ],
+  "workItemBranch" : "feature/workflow-rule-nov20"
+}
