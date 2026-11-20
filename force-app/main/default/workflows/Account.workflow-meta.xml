@@ -10,6 +10,16 @@
         <senderType>CurrentUser</senderType>
         <template>unfiled$public/SupportCaseResponse</template>
     </alerts>
+    <alerts>
+        <fullName>Sample_Test_Workflow_Alert</fullName>
+        <description>Sample Test Workflow Alert</description>
+        <protected>false</protected>
+        <recipients>
+            <type>owner</type>
+        </recipients>
+        <senderType>CurrentUser</senderType>
+        <template>unfiled$public/SalesNewCustomerEmail</template>
+    </alerts>
     <rules>
         <fullName>Sample_Account_Workflow</fullName>
         <active>true</active>
