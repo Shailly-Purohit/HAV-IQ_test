@@ -1,1 +1,1 @@
-force-app/main/default/customMetadata/SampleConfig.DefaultConfig.md-meta.xml
+force-app/main/default/objects/SampleConfig__mdt
