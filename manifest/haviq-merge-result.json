@@ -1,0 +1,67 @@
+{
+ "summary": {
+  "files": 3,
+  "bothChanged": 3,
+  "policyResolved": 0,
+  "decided": 0,
+  "conflicts": 2
+ },
+ "policy": [],
+ "conflicts": [
+  {
+   "path": "force-app/main/default/flows/Simple_Test_Flow.flow-meta.xml",
+   "type": "Flow",
+   "kind": "add/add",
+   "engine": "git",
+   "entries": [],
+   "base": null,
+   "source": "90433d6c8cd7e75ee567f75adcc0ca9c08fe12bd",
+   "target": "d125185895a6a7903d5a3ba95ea27767778090c3",
+   "binary": false,
+   "sizes": {
+    "base": null,
+    "source": 2355,
+    "target": 1763
+   },
+   "sourceChange": {
+    "author": "HAV-IQ CI",
+    "date": "2026-11-24T12:16:23Z",
+    "subject": "Deploy: Dev \u2192 QA [haviq] [haviq-dep:a06fj00000QihGnAAJ]"
+   },
+   "targetChange": {
+    "author": "Shailly Purohit",
+    "date": "2026-11-20T20:46:55+06:00",
+    "subject": "Deploy: Dev \u2192 QA [haviq] [haviq-dep:a06fj00000QTvojAAD]"
+   }
+  },
+  {
+   "path": "sfdx-project.json",
+   "type": "Other",
+   "kind": "add/add",
+   "engine": "git",
+   "entries": [],
+   "base": null,
+   "source": "8e0d6d4c472ea4a62f06f839df719f64b527b5af",
+   "target": "b21bb42141ee5c9e18dfea3a37fc3cf9239a9832",
+   "binary": false,
+   "sizes": {
+    "base": null,
+    "source": 219,
+    "target": 220
+   },
+   "sourceChange": {
+    "author": "HAV-IQ CI",
+    "date": "2026-11-24T12:16:23Z",
+    "subject": "Deploy: Dev \u2192 QA [haviq] [haviq-dep:a06fj00000QihGnAAJ]"
+   },
+   "targetChange": {
+    "author": "Shailly-Purohit",
+    "date": "2026-11-23T13:41:53+06:00",
+    "subject": "Merge branch 'qa' into feature/custom-object-retry03-nov20"
+   }
+  }
+ ],
+ "workItemBranch": "feature/flow-24nov",
+ "targetHead": "c3268b601158cf6fc54f13b208c1b6bdc1104018",
+ "sourceHead": "278577061cdd064ec0d4c4faf4a46be07d647712"
+}
