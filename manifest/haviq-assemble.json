@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/tabs/haviq__Haviq_Regression_Run__c.tab-meta.xml",
+    "label" : "CustomTab:haviq__Haviq_Regression_Run__c"
+  } ],
+  "sourceBranch" : "dev"
+}
