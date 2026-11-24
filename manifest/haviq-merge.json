@@ -1,7 +1,0 @@
-{
-  "commitMessage" : "Deploy: QA → Production [haviq] [haviq-dep:a06fj00000QiYbiAAF]",
-  "decisions" : { },
-  "rules" : [ ],
-  "targetBranch" : "production",
-  "workItemBranch" : "feature/apex-page-24nov"
-}

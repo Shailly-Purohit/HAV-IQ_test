@@ -1,0 +1,41 @@
+{
+ "summary": {
+  "files": 4,
+  "bothChanged": 2,
+  "policyResolved": 0,
+  "decided": 0,
+  "conflicts": 1
+ },
+ "policy": [],
+ "conflicts": [
+  {
+   "path": "sfdx-project.json",
+   "type": "Other",
+   "kind": "add/add",
+   "engine": "git",
+   "entries": [],
+   "base": null,
+   "source": "8e0d6d4c472ea4a62f06f839df719f64b527b5af",
+   "target": "56bb280777db227a5529aff4dd4e98de9e5c86fb",
+   "binary": false,
+   "sizes": {
+    "base": null,
+    "source": 219,
+    "target": 147
+   },
+   "sourceChange": {
+    "author": "HAV-IQ CI",
+    "date": "2026-11-24T12:23:26Z",
+    "subject": "Deploy: Dev \u2192 QA [haviq] [haviq-dep:a06fj00000Qii4oAAB]"
+   },
+   "targetChange": {
+    "author": "Shailly Purohit",
+    "date": "2026-11-17T21:32:48+06:00",
+    "subject": "Deploy: QA \u2192 Production [haviq] [haviq-dep:a06fj00000QEKO6AAP]"
+   }
+  }
+ ],
+ "workItemBranch": "feature/apex-page-24nov",
+ "targetHead": "9037f2a83b178f78de0a3a6d35e54e333ecb593c",
+ "sourceHead": "546b291cdf85198edfc5fdf7c6daa37f20e05fa0"
+}
