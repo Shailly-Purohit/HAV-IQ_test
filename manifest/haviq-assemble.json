@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ "force-app/main/default/pages/Simple_Test_Page.page-meta.xml" ],
+    "primary" : "force-app/main/default/pages/Simple_Test_Page.page",
+    "label" : "ApexPage:Simple_Test_Page"
+  } ],
+  "sourceBranch" : "dev"
+}
