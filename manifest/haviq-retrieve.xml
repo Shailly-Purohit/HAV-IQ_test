@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  HAV-IQ delta manifest — auto-generated per deploy.
+  Lists ONLY the components selected for this specific deploy.
+  Components NOT listed here are NOT removed from the target org.
+  Destructive removals go in manifest/destructiveChanges.xml.
+-->
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    <types>
+        <members>Sample_Test_Permission</members>
+        <name>PermissionSet</name>
+    </types>
+    <version>64.0</version>
+</Package>
