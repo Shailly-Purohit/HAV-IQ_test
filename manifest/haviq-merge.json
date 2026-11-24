@@ -1,0 +1,9 @@
+{
+  "commitMessage" : "Deploy: QA → Production [haviq] [haviq-dep:a06fj00000QilXJAAZ]",
+  "decisions" : {
+    "sfdx-project.json" : "source"
+  },
+  "rules" : [ ],
+  "targetBranch" : "production",
+  "workItemBranch" : "feature/apex-trigger-nov24"
+}
