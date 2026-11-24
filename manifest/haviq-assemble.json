@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ "force-app/main/default/objects/Sample_Project__c/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/Sample_Project__c/Sample_Project__c.object-meta.xml",
+    "label" : "CustomObject:Sample_Project__c"
+  } ],
+  "sourceBranch" : "dev"
+}
