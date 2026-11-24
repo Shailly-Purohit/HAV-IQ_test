@@ -1,9 +1,0 @@
-{
-  "components" : [ {
-    "prefixes" : [ ],
-    "required" : [ ],
-    "primary" : "force-app/main/default/layouts/FlowRecord-Flow Layout.layout-meta.xml",
-    "label" : "Layout:FlowRecord-Flow Layout"
-  } ],
-  "sourceBranch" : "dev"
-}
