@@ -1,0 +1,14 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/applications/Sample_Test_Application.app-meta.xml",
+    "label" : "CustomApplication:Sample_Test_Application"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/flexipages/Sample_Test_Application_UtilityBar.flexipage-meta.xml",
+    "label" : "FlexiPage:Sample_Test_Application_UtilityBar"
+  } ],
+  "sourceBranch" : "dev"
+}
