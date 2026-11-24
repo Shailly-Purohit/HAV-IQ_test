@@ -7,8 +7,12 @@
 -->
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
     <types>
-        <members>HAVIQ_Sample_Label</members>
-        <name>CustomLabel</name>
+        <members>Sample_Test_Application</members>
+        <name>CustomApplication</name>
+    </types>
+    <types>
+        <members>Sample_Test_Application_UtilityBar</members>
+        <name>FlexiPage</name>
     </types>
     <version>64.0</version>
 </Package>
