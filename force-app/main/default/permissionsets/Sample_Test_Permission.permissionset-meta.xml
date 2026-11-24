@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description>Sample permission set for metadata deployment testing</description>
+    <hasActivationRequired>false</hasActivationRequired>
+    <label>Sample Test Permission</label>
+</PermissionSet>
