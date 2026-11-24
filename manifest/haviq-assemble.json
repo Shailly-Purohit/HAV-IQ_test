@@ -1,0 +1,14 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/customMetadata/SampleConfig.DefaultConfig.md-meta.xml",
+    "label" : "CustomMetadata:SampleConfig.DefaultConfig"
+  }, {
+    "prefixes" : [ "force-app/main/default/objects/SampleConfig__mdt/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/SampleConfig__mdt/SampleConfig__mdt.object-meta.xml",
+    "label" : "CustomObject:SampleConfig__mdt"
+  } ],
+  "sourceBranch" : "dev"
+}
