@@ -1,9 +1,0 @@
-{
-  "commitMessage" : "Deploy: Dev → QA [haviq] [haviq-dep:a06fj00000QjMbhAAF]",
-  "decisions" : {
-    "force-app/main/default/labels/CustomLabels.labels-meta.xml" : "source"
-  },
-  "rules" : [ ],
-  "targetBranch" : "qa",
-  "workItemBranch" : "feature/custom-label-nov24"
-}

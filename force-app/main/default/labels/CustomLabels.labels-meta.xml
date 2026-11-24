@@ -5,6 +5,6 @@
         <language>en_US</language>
         <protected>false</protected>
         <shortDescription>HAVIQ Sample Label</shortDescription>
-        <value>Sample Custom Label for QA to Production testing</value>
+        <value>HAV-IQ QA Test Label Value</value>
     </labels>
 </CustomLabels>
