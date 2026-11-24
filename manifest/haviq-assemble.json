@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/namedCredentials/HAVIQ_Sample_Credential.namedCredential-meta.xml",
+    "label" : "NamedCredential:HAVIQ_Sample_Credential"
+  } ],
+  "sourceBranch" : "dev"
+}
