@@ -1,0 +1,10 @@
+{
+  "commitMessage" : "Deploy: Dev → QA [haviq] [haviq-dep:a06fj00000QihGnAAJ]",
+  "decisions" : {
+    "force-app/main/default/flows/Simple_Test_Flow.flow-meta.xml" : "source",
+    "sfdx-project.json" : "source"
+  },
+  "rules" : [ ],
+  "targetBranch" : "qa",
+  "workItemBranch" : "feature/flow-24nov"
+}
