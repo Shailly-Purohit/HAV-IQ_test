@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/permissionsets/Sample_Test_Permission.permissionset-meta.xml",
+    "label" : "PermissionSet:Sample_Test_Permission"
+  } ],
+  "sourceBranch" : "dev"
+}
