@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "files": 2,
+  "bothChanged": 2,
+  "policyResolved": 0,
+  "decided": 0,
+  "conflicts": 1
+ },
+ "policy": [],
+ "conflicts": [
+  {
+   "path": "force-app/main/default/labels/CustomLabels.labels-meta.xml",
+   "type": "CustomLabels",
+   "kind": "add/add",
+   "engine": "haviq-xml",
+   "entries": [
+    "labels/HAVIQ_Sample_Label"
+   ],
+   "base": null,
+   "source": "77127b42fb37edaf6a5542279f9089aa2ee9a101",
+   "target": "64cc287925282b5aeacf91fb30142cb804f82558",
+   "binary": false,
+   "sizes": {
+    "base": null,
+    "source": 379,
+    "target": 400
+   },
+   "sourceChange": {
+    "author": "HAV-IQ CI",
+    "date": "2026-11-24T15:16:54Z",
+    "subject": "Deploy: Dev \u2192 QA [haviq] [haviq-dep:a06fj00000QjMbhAAF]"
+   },
+   "targetChange": {
+    "author": "Shailly-Purohit",
+    "date": "2026-11-19T18:49:52+06:00",
+    "subject": "Add HAVIQ_Sample_Label custom label to qa branch"
+   }
+  }
+ ],
+ "workItemBranch": "feature/custom-label-nov24",
+ "targetHead": "76598cc4f8027af363ccaafbc819997bcf5eb779",
+ "sourceHead": "a5921a0de82b5d3f902f5139aa1b010e577a270a"
+}
