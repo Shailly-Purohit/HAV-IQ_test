@@ -1,0 +1,21 @@
+{
+ "deployment": "a06fj00000Qj0L3AAJ",
+ "components": [
+  {
+   "type": "FlexiPage",
+   "fullName": "Sample_Test_Application_UtilityBar",
+   "lastModifiedDate": "2026-11-24T13:06:33.000Z",
+   "files": [
+    "flexipages/Sample_Test_Application_UtilityBar.flexipage-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomApplication",
+   "fullName": "Sample_Test_Application",
+   "lastModifiedDate": "2026-11-24T13:06:34.000Z",
+   "files": [
+    "applications/Sample_Test_Application.app-meta.xml"
+   ]
+  }
+ ]
+}
