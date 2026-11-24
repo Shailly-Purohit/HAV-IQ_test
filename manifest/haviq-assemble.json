@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ "force-app/main/default/triggers/SimpleContractTrigger.trigger-meta.xml" ],
+    "primary" : "force-app/main/default/triggers/SimpleContractTrigger.trigger",
+    "label" : "ApexTrigger:SimpleContractTrigger"
+  } ],
+  "sourceBranch" : "dev"
+}
