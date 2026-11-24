@@ -1,9 +1,0 @@
-{
-  "components" : [ {
-    "prefixes" : [ ],
-    "required" : [ ],
-    "primary" : "force-app/main/default/profiles/Admin.profile-meta.xml",
-    "label" : "Profile:Admin"
-  } ],
-  "sourceBranch" : "dev"
-}
