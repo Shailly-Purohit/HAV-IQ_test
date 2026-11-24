@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/flows/Simple_Test_Flow.flow-meta.xml",
+    "label" : "Flow:Simple_Test_Flow"
+  } ],
+  "sourceBranch" : "dev"
+}
