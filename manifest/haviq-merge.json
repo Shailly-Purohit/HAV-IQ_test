@@ -1,0 +1,7 @@
+{
+  "commitMessage" : "Deploy: Dev → QA [haviq] [haviq-dep:a06fj00000QinHNAAZ]",
+  "decisions" : { },
+  "rules" : [ ],
+  "targetBranch" : "qa",
+  "workItemBranch" : "feature/profile-nov24"
+}
