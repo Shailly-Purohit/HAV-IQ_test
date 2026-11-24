@@ -1,0 +1,9 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/namedCredentials/Sample_Test_Credential.namedCredential-meta.xml",
+    "label" : "NamedCredential:Sample_Test_Credential"
+  } ],
+  "sourceBranch" : "dev"
+}
