@@ -1,0 +1,7 @@
+{
+  "commitMessage" : "Deploy: QA → Production [haviq] [haviq-dep:a06fj00000Qj0L3AAJ]",
+  "decisions" : { },
+  "rules" : [ ],
+  "targetBranch" : "production",
+  "workItemBranch" : "feature/custom-application-24nov"
+}
