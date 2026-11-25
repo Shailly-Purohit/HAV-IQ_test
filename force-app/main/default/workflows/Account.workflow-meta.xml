@@ -10,4 +10,14 @@
         <senderType>CurrentUser</senderType>
         <template>unfiled$public/SalesNewCustomerEmail</template>
     </alerts>
+    <alerts>
+        <fullName>HAVIQ_Sample_Alert</fullName>
+        <description>HAVIQ Sample Email Alert</description>
+        <protected>false</protected>
+        <recipients>
+            <type>owner</type>
+        </recipients>
+        <senderType>CurrentUser</senderType>
+        <template>unfiled$public/SupportCaseResponse</template>
+    </alerts>
 </Workflow>
