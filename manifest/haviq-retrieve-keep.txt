@@ -1,0 +1,6 @@
+force-app/main/default/labels
+force-app/main/default/objects/Account/fields
+force-app/main/default/objects/Account/validationRules
+force-app/main/default/objects/Bulk_Test_Description__c/fields
+force-app/main/default/permissionsets
+force-app/main/default/remoteSiteSettings
