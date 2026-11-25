@@ -1,0 +1,14 @@
+{
+  "components" : [ {
+    "inline" : {
+      "member" : "Sample_Test_Workflow_Alert",
+      "element" : "alerts",
+      "root" : "Workflow"
+    },
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/workflows/Account.workflow-meta.xml",
+    "label" : "WorkflowAlert:Account.Sample_Test_Workflow_Alert"
+  } ],
+  "sourceBranch" : "dev"
+}
