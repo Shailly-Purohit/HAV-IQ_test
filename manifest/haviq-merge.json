@@ -1,0 +1,7 @@
+{
+  "commitMessage" : "Deploy: QA → Production [haviq] [haviq-dep:a06fj00000Qly4zAAB]",
+  "decisions" : { },
+  "rules" : [ ],
+  "targetBranch" : "production",
+  "workItemBranch" : "feature/workflow-alert"
+}
