@@ -1,6 +1,0 @@
-force-app/main/default/applications
-force-app/main/default/classes
-force-app/main/default/flexipages
-force-app/main/default/objects/Account/webLinks
-force-app/main/default/pages
-force-app/main/default/tabs
