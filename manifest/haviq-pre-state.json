@@ -1,0 +1,29 @@
+{
+ "deployment": "a06fj00000Qsi1tAAB",
+ "components": [
+  {
+   "type": "CustomField",
+   "fullName": "SampleConfig__mdt.Config_Value__c",
+   "lastModifiedDate": null,
+   "files": [
+    "objects/SampleConfig__mdt/fields/Config_Value__c.field-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomObject",
+   "fullName": "SampleConfig__mdt",
+   "lastModifiedDate": "2026-11-24T14:30:08.000Z",
+   "files": [
+    "objects/SampleConfig__mdt/SampleConfig__mdt.object-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomObject",
+   "fullName": "Bulk_Batch_3_Record__c",
+   "lastModifiedDate": "2026-11-26T03:49:34.000Z",
+   "files": [
+    "objects/Bulk_Batch_3_Record__c/Bulk_Batch_3_Record__c.object-meta.xml"
+   ]
+  }
+ ]
+}
