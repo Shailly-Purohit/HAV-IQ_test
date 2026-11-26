@@ -202,4 +202,22 @@
         <tab>Bulk_Batch2_Tab</tab>
         <visibility>DefaultOn</visibility>
     </tabVisibilities>
+    <applicationVisibilities>
+        <application>Bulk_Batch_2_App</application>
+        <default>false</default>
+        <visible>false</visible>
+    </applicationVisibilities>
+    <classAccesses>
+        <apexClass>BulkBatch2Utility</apexClass>
+        <enabled>false</enabled>
+    </classAccesses>
+    <fieldPermissions>
+        <editable>false</editable>
+        <field>SampleConfig__mdt.Config_Value__c</field>
+        <readable>false</readable>
+    </fieldPermissions>
+    <pageAccesses>
+        <apexPage>BulkBatch2Page</apexPage>
+        <enabled>false</enabled>
+    </pageAccesses>
 </Profile>
