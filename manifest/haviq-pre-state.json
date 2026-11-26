@@ -1,0 +1,29 @@
+{
+ "deployment": "a06fj00000QsqM1AAJ",
+ "components": [
+  {
+   "type": "WebLink",
+   "fullName": "Account.Bulk_Batch_2_Link",
+   "lastModifiedDate": null,
+   "files": [
+    "objects/Account/webLinks/Bulk_Batch_2_Link.webLink-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomObject",
+   "fullName": "Account",
+   "lastModifiedDate": "2026-11-26T15:54:10.881Z",
+   "files": [
+    "objects/Account/Account.object-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomApplication",
+   "fullName": "Bulk_Batch_2_App",
+   "lastModifiedDate": "2026-11-25T15:11:42.000Z",
+   "files": [
+    "applications/Bulk_Batch_2_App.app-meta.xml"
+   ]
+  }
+ ]
+}
