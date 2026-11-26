@@ -1,0 +1,61 @@
+{
+ "deployment": "a06fj00000QskJqAAJ",
+ "components": [
+  {
+   "type": "NamedCredential",
+   "fullName": "Batch_4_Test_Credential",
+   "lastModifiedDate": "2026-11-26T14:48:57.000Z",
+   "files": [
+    "namedCredentials/Batch_4_Test_Credential.namedCredential-meta.xml"
+   ]
+  },
+  {
+   "type": "FlexiPage",
+   "fullName": "Bulk_Batch_4_Test_Home",
+   "lastModifiedDate": "2026-11-26T09:41:28.000Z",
+   "files": [
+    "flexipages/Bulk_Batch_4_Test_Home.flexipage-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomTab",
+   "fullName": "Bulk_Batch2_Tab",
+   "lastModifiedDate": "2026-11-25T15:11:42.000Z",
+   "files": [
+    "tabs/Bulk_Batch2_Tab.tab-meta.xml"
+   ]
+  },
+  {
+   "type": "Workflow",
+   "fullName": "Account",
+   "lastModifiedDate": "2026-11-26T16:21:52.725Z",
+   "files": [
+    "workflows/Account.workflow-meta.xml"
+   ]
+  },
+  {
+   "type": "Profile",
+   "fullName": "Bulk Batch 4 Test Profile",
+   "lastModifiedDate": "2026-11-26T14:48:59.000Z",
+   "files": [
+    "profiles/Bulk Batch 4 Test Profile.profile-meta.xml"
+   ]
+  },
+  {
+   "type": "PermissionSet",
+   "fullName": "Bulk_Deployment_Test",
+   "lastModifiedDate": "2026-11-26T07:41:37.000Z",
+   "files": [
+    "permissionsets/Bulk_Deployment_Test.permissionset-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomLabels",
+   "fullName": "CustomLabels",
+   "lastModifiedDate": "2026-11-26T16:21:52.051Z",
+   "files": [
+    "labels/CustomLabels.labels-meta.xml"
+   ]
+  }
+ ]
+}
