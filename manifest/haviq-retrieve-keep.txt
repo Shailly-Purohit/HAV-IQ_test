@@ -1,0 +1,3 @@
+force-app/main/default/customMetadata
+force-app/main/default/namedCredentials
+force-app/main/default/profiles
