@@ -1,0 +1,3 @@
+force-app/main/default/labels
+force-app/main/default/permissionsets
+force-app/main/default/remoteSiteSettings
