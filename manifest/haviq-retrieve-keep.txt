@@ -1,2 +1,0 @@
-force-app/main/default/flexipages
-force-app/main/default/layouts
