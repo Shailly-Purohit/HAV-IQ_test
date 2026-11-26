@@ -1,0 +1,7 @@
+<aura:component implements="flexipage:availableForAllPageTypes" access="global">
+    <lightning:card title="Batch 3 Deployment Test">
+        <div class="slds-p-around_medium">
+            Aura component deployment successful.
+        </div>
+    </lightning:card>
+</aura:component>
