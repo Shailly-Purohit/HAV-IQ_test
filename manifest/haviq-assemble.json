@@ -1,0 +1,14 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/layouts/Bulk_Batch_3_Record__c-Bulk Batch 4 Test Layout.layout-meta.xml",
+    "label" : "Layout:Bulk_Batch_3_Record__c-Bulk Batch 4 Test Layout"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/flexipages/Bulk_Batch_4_Test_Home.flexipage-meta.xml",
+    "label" : "FlexiPage:Bulk_Batch_4_Test_Home"
+  } ],
+  "sourceBranch" : "dev"
+}
