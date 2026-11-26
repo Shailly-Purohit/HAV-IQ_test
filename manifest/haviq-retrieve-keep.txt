@@ -1,0 +1,11 @@
+force-app/main/default/aura/BulkBatch3Aura
+force-app/main/default/classes
+force-app/main/default/customMetadata
+force-app/main/default/flexipages
+force-app/main/default/flows
+force-app/main/default/lwc/bulkBatch3Panel
+force-app/main/default/objects/Bulk_Batch_3_Record__c
+force-app/main/default/objects/SampleConfig__mdt/fields
+force-app/main/default/pages
+force-app/main/default/tabs
+force-app/main/default/triggers
