@@ -1,0 +1,19 @@
+{
+  "components" : [ {
+    "prefixes" : [ "force-app/main/default/objects/Bulk_Batch_3_Record__c/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/Bulk_Batch_3_Record__c/Bulk_Batch_3_Record__c.object-meta.xml",
+    "label" : "CustomObject:Bulk_Batch_3_Record__c"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/SampleConfig__mdt/fields/Config_Value__c.field-meta.xml",
+    "label" : "CustomField:SampleConfig__mdt.Config_Value__c"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/Account/validationRules/Require_Bulk_Test_Description.validationRule-meta.xml",
+    "label" : "ValidationRule:Account.Require_Bulk_Test_Description"
+  } ],
+  "sourceBranch" : "dev"
+}
