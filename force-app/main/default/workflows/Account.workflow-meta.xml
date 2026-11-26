@@ -20,11 +20,31 @@
         <senderType>CurrentUser</senderType>
         <template>unfiled$public/SalesNewCustomerEmail</template>
     </alerts>
+    <alerts>
+        <fullName>Bulk_Batch_5_Test_Alert</fullName>
+        <description>Bulk Batch 5 Test Alert</description>
+        <protected>false</protected>
+        <recipients>
+            <type>accountOwner</type>
+        </recipients>
+        <senderType>CurrentUser</senderType>
+        <template>unfiled$public/Bulk_Batch_5_Test_Template</template>
+    </alerts>
     <rules>
         <fullName>Sample_Account_Workflow</fullName>
         <active>true</active>
         <description>Sample workflow rule for metadata deployment testing</description>
         <formula>AnnualRevenue &gt; 0</formula>
         <triggerType>onAllChanges</triggerType>
+    </rules>
+    <rules>
+        <fullName>Bulk_Batch_5_Test_Rule</fullName>
+        <active>false</active>
+        <criteriaItems>
+            <field>Account.Name</field>
+            <operation>notEqual</operation>
+        </criteriaItems>
+        <description>Batch 5 workflow rule deployment test</description>
+        <triggerType>onCreateOrTriggeringUpdate</triggerType>
     </rules>
 </Workflow>
