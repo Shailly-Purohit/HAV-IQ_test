@@ -1,0 +1,4 @@
+<apex:page >
+    <h1>Batch 2 Deployment Test</h1>
+    <p>Visualforce page deployment successful.</p>
+</apex:page>
