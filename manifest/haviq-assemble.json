@@ -1,0 +1,14 @@
+{
+  "components" : [ {
+    "prefixes" : [ "force-app/main/default/lwc/bulkBatch3Panel/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/lwc/bulkBatch3Panel/bulkBatch3Panel.js",
+    "label" : "LightningComponentBundle:bulkBatch3Panel"
+  }, {
+    "prefixes" : [ "force-app/main/default/aura/BulkBatch3Aura/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/aura/BulkBatch3Aura/BulkBatch3Aura.cmp",
+    "label" : "AuraDefinitionBundle:BulkBatch3Aura"
+  } ],
+  "sourceBranch" : "dev"
+}
