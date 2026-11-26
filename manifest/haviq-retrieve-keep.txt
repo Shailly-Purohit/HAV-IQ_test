@@ -1,0 +1,3 @@
+force-app/main/default/aura/BulkBatch3Aura
+force-app/main/default/lwc/bulkBatch3Panel
+force-app/main/default/objects/Bulk_Batch_3_Record__c
