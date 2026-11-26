@@ -1,0 +1,59 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ "force-app/main/default/classes/BulkBatch2Utility.cls-meta.xml" ],
+    "primary" : "force-app/main/default/classes/BulkBatch2Utility.cls",
+    "label" : "ApexClass:BulkBatch2Utility"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ "force-app/main/default/triggers/BulkBatch3Trigger.trigger-meta.xml" ],
+    "primary" : "force-app/main/default/triggers/BulkBatch3Trigger.trigger",
+    "label" : "ApexTrigger:BulkBatch3Trigger"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ "force-app/main/default/pages/BulkBatch2Page.page-meta.xml" ],
+    "primary" : "force-app/main/default/pages/BulkBatch2Page.page",
+    "label" : "ApexPage:BulkBatch2Page"
+  }, {
+    "prefixes" : [ "force-app/main/default/lwc/bulkBatch3Panel/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/lwc/bulkBatch3Panel/bulkBatch3Panel.js",
+    "label" : "LightningComponentBundle:bulkBatch3Panel"
+  }, {
+    "prefixes" : [ "force-app/main/default/aura/BulkBatch3Aura/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/aura/BulkBatch3Aura/BulkBatch3Aura.cmp",
+    "label" : "AuraDefinitionBundle:BulkBatch3Aura"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/flows/Bulk_Batch_3_Record_Flow.flow-meta.xml",
+    "label" : "Flow:Bulk_Batch_3_Record_Flow"
+  }, {
+    "prefixes" : [ "force-app/main/default/objects/Bulk_Batch_3_Record__c/" ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/Bulk_Batch_3_Record__c/Bulk_Batch_3_Record__c.object-meta.xml",
+    "label" : "CustomObject:Bulk_Batch_3_Record__c"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/SampleConfig__mdt/fields/Config_Value__c.field-meta.xml",
+    "label" : "CustomField:SampleConfig__mdt.Config_Value__c"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/customMetadata/SampleConfig.Batch_4_Deployment_Test.md-meta.xml",
+    "label" : "CustomMetadata:SampleConfig.Batch_4_Deployment_Test"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/flexipages/Bulk_Batch_4_Test_Home.flexipage-meta.xml",
+    "label" : "FlexiPage:Bulk_Batch_4_Test_Home"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/tabs/Bulk_Batch2_Tab.tab-meta.xml",
+    "label" : "CustomTab:Bulk_Batch2_Tab"
+  } ],
+  "sourceBranch" : "dev"
+}
