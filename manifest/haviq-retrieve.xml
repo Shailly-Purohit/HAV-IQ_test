@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  HAV-IQ delta manifest — auto-generated per deploy.
+  Lists ONLY the components selected for this specific deploy.
+  Components NOT listed here are NOT removed from the target org.
+  Destructive removals go in manifest/destructiveChanges.xml.
+-->
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    <types>
+        <members>BulkBatch2Utility</members>
+        <name>ApexClass</name>
+    </types>
+    <types>
+        <members>BulkBatch3Trigger</members>
+        <name>ApexTrigger</name>
+    </types>
+    <types>
+        <members>BulkBatch2Page</members>
+        <name>ApexPage</name>
+    </types>
+    <types>
+        <members>bulkBatch3Panel</members>
+        <name>LightningComponentBundle</name>
+    </types>
+    <types>
+        <members>BulkBatch3Aura</members>
+        <name>AuraDefinitionBundle</name>
+    </types>
+    <types>
+        <members>Bulk_Batch_3_Record_Flow</members>
+        <name>Flow</name>
+    </types>
+    <types>
+        <members>Bulk_Batch_3_Record__c</members>
+        <name>CustomObject</name>
+    </types>
+    <types>
+        <members>SampleConfig__mdt.Config_Value__c</members>
+        <name>CustomField</name>
+    </types>
+    <types>
+        <members>SampleConfig.Batch_4_Deployment_Test</members>
+        <name>CustomMetadata</name>
+    </types>
+    <types>
+        <members>Bulk_Batch_3_Record__c-Bulk Batch 4 Test Layout</members>
+        <name>Layout</name>
+    </types>
+    <types>
+        <members>Bulk_Batch_4_Test_Home</members>
+        <name>FlexiPage</name>
+    </types>
+    <types>
+        <members>Bulk_Batch2_Tab</members>
+        <name>CustomTab</name>
+    </types>
+    <types>
+        <members>Bulk_Deployment_Test</members>
+        <name>PermissionSet</name>
+    </types>
+    <types>
+        <members>Bulk Batch 4 Test Profile</members>
+        <name>Profile</name>
+    </types>
+    <types>
+        <members>Account.Require_Bulk_Test_Description</members>
+        <name>ValidationRule</name>
+    </types>
+    <types>
+        <members>Account.Bulk_Batch_5_Test_Rule</members>
+        <name>WorkflowRule</name>
+    </types>
+    <types>
+        <members>Bulk_Deployment_Status</members>
+        <name>CustomLabel</name>
+    </types>
+    <types>
+        <members>Bulk_Test_RemoteSite</members>
+        <name>RemoteSiteSetting</name>
+    </types>
+    <types>
+        <members>Batch_4_Test_Credential</members>
+        <name>NamedCredential</name>
+    </types>
+    <types>
+        <members>Bulk_Batch_2_App</members>
+        <name>CustomApplication</name>
+    </types>
+    <types>
+        <members>Account.Bulk_Batch_2_Link</members>
+        <name>WebLink</name>
+    </types>
+    <types>
+        <members>Account.Bulk_Batch_5_Test_Alert</members>
+        <name>WorkflowAlert</name>
+    </types>
+    <version>64.0</version>
+</Package>
