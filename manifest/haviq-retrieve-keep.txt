@@ -1,3 +1,0 @@
-force-app/main/default/objects/Account/validationRules
-force-app/main/default/objects/Bulk_Batch_3_Record__c
-force-app/main/default/objects/SampleConfig__mdt/fields
