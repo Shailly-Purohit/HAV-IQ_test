@@ -1,0 +1,16 @@
+force-app/main/default/customMetadata
+force-app/main/default/flexipages
+force-app/main/default/layouts
+force-app/main/default/namedCredentials
+force-app/main/default/objects/Active/fields
+force-app/main/default/objects/Bulk_Test_Description/fields
+force-app/main/default/objects/Bulk_Test_Description__c/fields
+force-app/main/default/objects/CustomerPriority/fields
+force-app/main/default/objects/NumberofLocations/fields
+force-app/main/default/objects/SLA/fields
+force-app/main/default/objects/SLAExpirationDate/fields
+force-app/main/default/objects/SLASerialNumber/fields
+force-app/main/default/objects/Test_Description/fields
+force-app/main/default/objects/Test_Description__c/fields
+force-app/main/default/objects/UpsellOpportunity/fields
+force-app/main/default/profiles
