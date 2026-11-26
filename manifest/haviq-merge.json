@@ -1,0 +1,7 @@
+{
+  "commitMessage" : "Deploy: Dev → QA [haviq] [haviq-dep:a06fj00000Qr4XxAAJ]",
+  "decisions" : { },
+  "rules" : [ ],
+  "targetBranch" : "qa",
+  "workItemBranch" : "feature/bulk-batch5-nov25"
+}
