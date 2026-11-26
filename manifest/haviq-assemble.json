@@ -1,0 +1,19 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/layouts/Account-Bulk Batch 4 Test Layout.layout-meta.xml",
+    "label" : "Layout:Account-Bulk Batch 4 Test Layout"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/flexipages/Bulk_Batch_4_Test_Home.flexipage-meta.xml",
+    "label" : "FlexiPage:Bulk_Batch_4_Test_Home"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/objects/Account/webLinks/Billing.webLink-meta.xml",
+    "label" : "WebLink:Account.Billing"
+  } ],
+  "sourceBranch" : "dev"
+}
