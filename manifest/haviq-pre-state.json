@@ -1,0 +1,29 @@
+{
+ "deployment": "a06fj00000QrpTdAAJ",
+ "components": [
+  {
+   "type": "WebLink",
+   "fullName": "Account.Billing",
+   "lastModifiedDate": null,
+   "files": [
+    "objects/Account/webLinks/Billing.webLink-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomObject",
+   "fullName": "Account",
+   "lastModifiedDate": "2026-11-26T10:29:13.122Z",
+   "files": [
+    "objects/Account/Account.object-meta.xml"
+   ]
+  },
+  {
+   "type": "FlexiPage",
+   "fullName": "Bulk_Batch_4_Test_Home",
+   "lastModifiedDate": "2026-11-26T09:38:15.000Z",
+   "files": [
+    "flexipages/Bulk_Batch_4_Test_Home.flexipage-meta.xml"
+   ]
+  }
+ ]
+}
