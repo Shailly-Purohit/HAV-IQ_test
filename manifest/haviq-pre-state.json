@@ -1,0 +1,30 @@
+{
+ "deployment": "a06fj00000QrborAAB",
+ "components": [
+  {
+   "type": "ApexPage",
+   "fullName": "BulkBatch2Page",
+   "lastModifiedDate": "2026-11-25T15:11:40.000Z",
+   "files": [
+    "pages/BulkBatch2Page.page",
+    "pages/BulkBatch2Page.page-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomTab",
+   "fullName": "Bulk_Batch2_Tab",
+   "lastModifiedDate": "2026-11-25T15:11:42.000Z",
+   "files": [
+    "tabs/Bulk_Batch2_Tab.tab-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomApplication",
+   "fullName": "Bulk_Batch_2_App",
+   "lastModifiedDate": "2026-11-25T15:11:42.000Z",
+   "files": [
+    "applications/Bulk_Batch_2_App.app-meta.xml"
+   ]
+  }
+ ]
+}
