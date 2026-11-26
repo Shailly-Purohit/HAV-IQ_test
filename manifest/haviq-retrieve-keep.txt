@@ -1,0 +1,2 @@
+force-app/main/default/applications
+force-app/main/default/objects/Account/webLinks
