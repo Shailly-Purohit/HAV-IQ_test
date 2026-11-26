@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">
+    <labels>
+        <fullName>Bulk_Deployment_Status</fullName>
+        <language>en_US</language>
+        <protected>true</protected>
+        <shortDescription>Bulk Deployment Status</shortDescription>
+        <value>Batch 1 deployment test successful</value>
+    </labels>
+</CustomLabels>
