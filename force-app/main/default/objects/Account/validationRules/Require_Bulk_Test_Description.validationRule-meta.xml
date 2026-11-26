@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Require_Bulk_Test_Description</fullName>
+    <active>true</active>
+    <description>Requires Bulk Test Description for bulk deployment testing</description>
+    <errorConditionFormula>AND(
+    ISNEW(),
+    ISBLANK(Bulk_Test_Description__c)
+)</errorConditionFormula>
+    <errorDisplayField>Bulk_Test_Description__c</errorDisplayField>
+    <errorMessage>Bulk Test Description is required for this test.</errorMessage>
+</ValidationRule>
