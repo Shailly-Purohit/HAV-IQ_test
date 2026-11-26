@@ -198,4 +198,8 @@
         <enabled>true</enabled>
         <name>ViewSetupAuditTrail</name>
     </userPermissions>
+    <tabVisibilities>
+        <tab>Bulk_Batch2_Tab</tab>
+        <visibility>DefaultOn</visibility>
+    </tabVisibilities>
 </Profile>
