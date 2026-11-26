@@ -1,0 +1,2 @@
+force-app/main/default/customMetadata
+force-app/main/default/objects/SampleConfig__mdt/fields
