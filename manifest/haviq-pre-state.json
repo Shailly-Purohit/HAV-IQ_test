@@ -1,0 +1,174 @@
+{
+ "deployment": "a06fj00000Qt0lBAAR",
+ "components": [
+  {
+   "type": "LightningComponentBundle",
+   "fullName": "bulkBatch3Panel",
+   "lastModifiedDate": null,
+   "files": [
+    "lwc/bulkBatch3Panel/bulkBatch3Panel.html",
+    "lwc/bulkBatch3Panel/bulkBatch3Panel.js",
+    "lwc/bulkBatch3Panel/bulkBatch3Panel.js-meta.xml"
+   ]
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura",
+   "lastModifiedDate": null,
+   "files": [
+    "aura/BulkBatch3Aura/BulkBatch3Aura.auradoc",
+    "aura/BulkBatch3Aura/BulkBatch3Aura.cmp",
+    "aura/BulkBatch3Aura/BulkBatch3Aura.cmp-meta.xml",
+    "aura/BulkBatch3Aura/BulkBatch3Aura.css",
+    "aura/BulkBatch3Aura/BulkBatch3Aura.design",
+    "aura/BulkBatch3Aura/BulkBatch3Aura.svg",
+    "aura/BulkBatch3Aura/BulkBatch3AuraController.js",
+    "aura/BulkBatch3Aura/BulkBatch3AuraHelper.js",
+    "aura/BulkBatch3Aura/BulkBatch3AuraRenderer.js"
+   ]
+  },
+  {
+   "type": "ApexPage",
+   "fullName": "BulkBatch2Page",
+   "lastModifiedDate": "2026-11-25T15:11:40.000Z",
+   "files": [
+    "pages/BulkBatch2Page.page",
+    "pages/BulkBatch2Page.page-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomField",
+   "fullName": "SampleConfig__mdt.Config_Value__c",
+   "lastModifiedDate": null,
+   "files": [
+    "objects/SampleConfig__mdt/fields/Config_Value__c.field-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomObject",
+   "fullName": "SampleConfig__mdt",
+   "lastModifiedDate": "2026-11-24T14:30:08.000Z",
+   "files": [
+    "objects/SampleConfig__mdt/SampleConfig__mdt.object-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomObject",
+   "fullName": "Bulk_Batch_3_Record__c",
+   "lastModifiedDate": "2026-11-26T03:49:34.000Z",
+   "files": [
+    "objects/Bulk_Batch_3_Record__c/Bulk_Batch_3_Record__c.object-meta.xml"
+   ]
+  },
+  {
+   "type": "FlexiPage",
+   "fullName": "Bulk_Batch_4_Test_Home",
+   "lastModifiedDate": "2026-11-26T09:41:28.000Z",
+   "files": [
+    "flexipages/Bulk_Batch_4_Test_Home.flexipage-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomTab",
+   "fullName": "Bulk_Batch2_Tab",
+   "lastModifiedDate": "2026-11-25T15:11:42.000Z",
+   "files": [
+    "tabs/Bulk_Batch2_Tab.tab-meta.xml"
+   ]
+  },
+  {
+   "type": "CustomMetadata",
+   "fullName": "SampleConfig.Batch_4_Deployment_Test",
+   "lastModifiedDate": "2026-11-26T14:48:58.000Z",
+   "files": [
+    "customMetadata/SampleConfig.Batch_4_Deployment_Test.md-meta.xml"
+   ]
+  },
+  {
+   "type": "Flow",
+   "fullName": "Bulk_Batch_3_Record_Flow",
+   "lastModifiedDate": "2026-11-26T03:49:33.000Z",
+   "files": [
+    "flows/Bulk_Batch_3_Record_Flow.flow-meta.xml"
+   ]
+  },
+  {
+   "type": "ApexClass",
+   "fullName": "BulkBatch2Utility",
+   "lastModifiedDate": "2026-11-25T15:11:42.000Z",
+   "files": [
+    "classes/BulkBatch2Utility.cls",
+    "classes/BulkBatch2Utility.cls-meta.xml"
+   ]
+  },
+  {
+   "type": "ApexTrigger",
+   "fullName": "BulkBatch3Trigger",
+   "lastModifiedDate": "2026-11-26T03:49:33.000Z",
+   "files": [
+    "triggers/BulkBatch3Trigger.trigger",
+    "triggers/BulkBatch3Trigger.trigger-meta.xml"
+   ]
+  },
+  {
+   "type": "LightningComponentBundle",
+   "fullName": "bulkBatch3Panel/bulkBatch3Panel.html",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "LightningComponentBundle",
+   "fullName": "bulkBatch3Panel/bulkBatch3Panel.js",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3Aura.cmp",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3Aura.design",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3AuraRenderer.js",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3Aura.svg",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3AuraHelper.js",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3AuraController.js",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3Aura.auradoc",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  },
+  {
+   "type": "AuraDefinitionBundle",
+   "fullName": "BulkBatch3Aura/BulkBatch3Aura.css",
+   "lastModifiedDate": "2026-11-26T15:47:16.000Z",
+   "files": []
+  }
+ ]
+}
