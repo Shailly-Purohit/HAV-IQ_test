@@ -1,0 +1,19 @@
+{
+  "components" : [ {
+    "prefixes" : [ ],
+    "required" : [ "force-app/main/default/pages/BulkBatch2Page.page-meta.xml" ],
+    "primary" : "force-app/main/default/pages/BulkBatch2Page.page",
+    "label" : "ApexPage:BulkBatch2Page"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/tabs/Bulk_Batch2_Tab.tab-meta.xml",
+    "label" : "CustomTab:Bulk_Batch2_Tab"
+  }, {
+    "prefixes" : [ ],
+    "required" : [ ],
+    "primary" : "force-app/main/default/applications/Bulk_Batch_2_App.app-meta.xml",
+    "label" : "CustomApplication:Bulk_Batch_2_App"
+  } ],
+  "sourceBranch" : "dev"
+}
